@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 from .class_weights import compute_class_weights_from_parquet
 from .dataset import GeoDataset
 from .geo import haversine_km
-from .hierarchy import mask_r7_logits, hierarchical_predict
+from .hierarchy import hierarchical_predict, mask_r7_logits
 from .geo_loss import GeoSoftTargetLoss
 from .hardneg import HardNegConfig, build_sample_weights, load_pool, save_pool, update_pool
 from .metrics_geo import compute_geo_kpi
@@ -73,7 +73,6 @@ def _dump_val_topk_parquet(
 
     N, C = logits_all.shape
     k = min(int(k), int(C))
-
     topk_vals, topk_idxs = torch.topk(logits_all, k=k, dim=1)
 
     if len(image_ids) != int(N):
@@ -143,26 +142,21 @@ def run_training(
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    # --------------------
-    # Optional knobs (no cfg requirement)
-    # --------------------
     dump_k = int(getattr(cfg, "dump_topk", 10))
     dump_k = max(dump_k, 10)
     dump_k = max(dump_k, int(getattr(cfg, "topk", 5)))
 
-    enable_proxies = bool(getattr(cfg, "enable_proxies", True))
-    proxy_loss_weight = float(getattr(cfg, "proxy_loss_weight", 0.35))
+    proxy_loss_weight = float(getattr(cfg, "proxy_loss_weight", 0.35))  # kept for metrics compat
 
     hierarchical_enabled = bool(getattr(cfg, "hierarchical_enabled", False))
     if hierarchical_enabled:
-        if num_classes_r6 <= 0:
+        if int(num_classes_r6) <= 0:
             raise RuntimeError("hierarchical_enabled=True but num_classes_r6 is missing/invalid")
         if r7_parent is None:
             raise RuntimeError("hierarchical_enabled=True but r7_parent mapping is missing")
 
-    # Hard-negative mining knobs (no cfg requirement)
     hard_cfg = HardNegConfig(
-        enabled=bool(getattr(cfg, "hardneg_enabled", True)),
+        enabled=bool(getattr(cfg, "hardneg_enabled", False)),
         threshold_km=float(getattr(cfg, "hardneg_threshold_km", 500.0)),
         boost=float(getattr(cfg, "hardneg_boost", 4.0)),
         max_pool=int(getattr(cfg, "hardneg_max_pool", 20000)),
@@ -171,23 +165,22 @@ def run_training(
     hard_pool_path = run_dir / "hardneg_pool.json"
     hard_pool_ids = load_pool(hard_pool_path)
 
-    # default feature file if exists
-    default_h3f = Path("data/index/h3_features.parquet")
-    h3_features_path = str(default_h3f) if (enable_proxies and default_h3f.exists()) else None
+    # NOTE:
+    # We intentionally DO NOT pass h3_features_path to GeoDataset anymore.
+    # Dataset is processed-only and may not support proxy features at all.
+    # Model still supports proxies via num_proxies=0 (disabled).
 
-    # Model with proxy head if enabled
-    num_proxies = 5 if h3_features_path is not None else 0
+    num_proxies = 0
     model = MultiScaleCNN(
         num_classes=num_classes,
         dropout=cfg.dropout,
         num_proxies=num_proxies,
-        num_classes_r6=num_classes_r6,
+        num_classes_r6=int(num_classes_r6),
         hierarchical_enabled=hierarchical_enabled,
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    # class-weighted CE to fight imbalance
     class_w = compute_class_weights_from_parquet(
         parquet_path,
         split="train",
@@ -206,14 +199,11 @@ def run_training(
         ).to(device)
         ce_r6 = nn.CrossEntropyLoss(weight=class_w_r6)
 
-    # proxy loss (regression)
-    proxy_loss_fn = nn.SmoothL1Loss(beta=0.5)
-
     geo_loss: Optional[GeoSoftTargetLoss] = None
-    if cfg.geo_loss_enabled:
+    if bool(getattr(cfg, "geo_loss_enabled", False)):
         if distance_km is None:
             raise RuntimeError("geo_loss_enabled=True but distance_km is None")
-        geo_loss = GeoSoftTargetLoss(distance_km.to(device), tau_km=cfg.geo_tau_km)
+        geo_loss = GeoSoftTargetLoss(distance_km.to(device), tau_km=float(getattr(cfg, "geo_tau_km", 1.8)))
 
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -222,14 +212,11 @@ def run_training(
     last_ckpt = ckpt_dir / "last.pt"
     metrics_csv = run_dir / "metrics.csv"
 
-    r7_parent_t = None
-    if hierarchical_enabled:
-        r7_parent_t = r7_parent.to(device)
+    r7_parent_t = r7_parent.to(device) if (hierarchical_enabled and r7_parent is not None) else None
 
     best_acc = -1.0
     best_epoch = -1
     best_size = -1
-
     best_p90 = float("inf")
     best_median = float("inf")
 
@@ -240,8 +227,6 @@ def run_training(
     use_cuda = device == "cuda"
     pin = bool(use_cuda)
     persistent = bool(cfg.num_workers and int(cfg.num_workers) > 0)
-
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -276,24 +261,20 @@ def run_training(
             image_size = int(cfg.image_sizes[size_idx])
             batch_size = int(cfg.batch_sizes[size_idx])
 
+            # IMPORTANT: no h3_features_path kwarg here
             train_ds = GeoDataset(
                 parquet_path,
                 "train",
                 image_size,
-                h3_features_path=h3_features_path,
                 hierarchical_enabled=hierarchical_enabled,
             )
             val_ds = GeoDataset(
                 parquet_path,
                 "val",
                 image_size,
-                h3_features_path=h3_features_path,
                 hierarchical_enabled=hierarchical_enabled,
             )
 
-            # --------------------
-            # Hard-negative sampler (if pool big enough)
-            # --------------------
             sampler = None
             shuffle = True
             if hard_cfg.enabled and len(hard_pool_ids) >= hard_cfg.min_count_to_enable:
@@ -327,7 +308,7 @@ def run_training(
             model.train()
             total_loss = 0.0
             total_main = 0.0
-            total_proxy = 0.0
+            total_proxy = 0.0  # always 0 (proxies disabled)
             n_batches = 0
             n_proxy_batches = 0
 
@@ -339,55 +320,44 @@ def run_training(
             )
 
             for batch in train_pbar:
-                # expected:
-                #   non-hier: (x, y, lat, lon, img_id) or (x, y, lat, lon, img_id, proxy_t)
-                #   hier:     (x, y_r6, y_r7, lat, lon, img_id) or (x, y_r6, y_r7, lat, lon, img_id, proxy_t)
                 if hierarchical_enabled:
-                    if len(batch) == 6:
-                        x, y6, y, _lat, _lon, _img_id = batch
-                        proxy_t = None
-                    else:
-                        x, y6, y, _lat, _lon, _img_id, proxy_t = batch
-                else:
-                    if len(batch) == 5:
-                        x, y, _lat, _lon, _img_id = batch
-                        proxy_t = None
-                    else:
-                        x, y, _lat, _lon, _img_id, proxy_t = batch
-
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                if hierarchical_enabled:
+                    # expected: (x, y6, y7, lat, lon, img_id) (proxy ignored)
+                    x, y6, y, _lat, _lon, _img_id = batch[:6]
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
                     y6 = y6.to(device, non_blocking=True)
-                if proxy_t is not None:
-                    proxy_t = proxy_t.to(device, non_blocking=True)
+                else:
+                    # expected: (x, y, lat, lon, img_id)
+                    x, y, _lat, _lon, _img_id = batch[:5]
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 out = model(x)
+
                 if hierarchical_enabled:
-                    if num_proxies > 0:
-                        logits_r6, logits_r7, proxy_pred = out
+                    # model returns (logits_r6, logits_r7) when proxies disabled
+                    if isinstance(out, tuple) and len(out) >= 2:
+                        logits_r6, logits_r7 = out[0], out[1]
                     else:
-                        logits_r6, logits_r7 = out
-                        proxy_pred = None
+                        raise RuntimeError("hierarchical_enabled=True but model did not return (logits_r6, logits_r7)")
 
                     loss_r6 = ce_r6(logits_r6, y6) if ce_r6 is not None else 0.0
+                    if r7_parent_t is None:
+                        raise RuntimeError("hierarchical_enabled=True but r7_parent_t is None")
                     logits_r7_masked = mask_r7_logits(logits_r7, y6, r7_parent_t)
+
                     if geo_loss is None:
                         loss_r7 = ce(logits_r7_masked, y)
                     else:
                         loss_geo = geo_loss(logits_r7_masked, y)
                         loss_ce = ce(logits_r7_masked, y)
                         loss_r7 = (1.0 - float(cfg.geo_mix_ce)) * loss_geo + float(cfg.geo_mix_ce) * loss_ce
+
                     loss_main = loss_r6 + loss_r7
                 else:
-                    if isinstance(out, tuple):
-                        logits, proxy_pred = out
-                    else:
-                        logits, proxy_pred = out, None
-
-                    # main loss
+                    logits = out[0] if isinstance(out, tuple) else out
                     if geo_loss is None:
                         loss_main = ce(logits, y)
                     else:
@@ -396,15 +366,6 @@ def run_training(
                         loss_main = (1.0 - float(cfg.geo_mix_ce)) * loss_geo + float(cfg.geo_mix_ce) * loss_ce
 
                 loss = loss_main
-                loss_proxy = None
-
-                # proxy loss only if both present
-                if proxy_pred is not None and proxy_t is not None:
-                    loss_proxy = proxy_loss_fn(proxy_pred, proxy_t)
-                    loss = loss + proxy_loss_weight * loss_proxy
-                    total_proxy += float(loss_proxy.item())
-                    n_proxy_batches += 1
-
                 loss.backward()
                 optimizer.step()
 
@@ -412,13 +373,12 @@ def run_training(
                 total_main += float(loss_main.item())
                 n_batches += 1
 
-                postfix = {
-                    "loss": f"{(total_loss / max(1,n_batches)):.4f}",
-                    "main": f"{(total_main / max(1,n_batches)):.4f}",
-                }
-                if loss_proxy is not None:
-                    postfix["proxy"] = f"{(total_proxy / max(1,n_proxy_batches)):.4f}"
-                train_pbar.set_postfix(postfix)
+                train_pbar.set_postfix(
+                    {
+                        "loss": f"{(total_loss / max(1, n_batches)):.4f}",
+                        "main": f"{(total_main / max(1, n_batches)):.4f}",
+                    }
+                )
 
             train_loss = total_loss / max(1, n_batches)
             train_loss_main = total_main / max(1, n_batches)
@@ -440,27 +400,18 @@ def run_training(
             with torch.no_grad():
                 for batch in val_pbar:
                     if hierarchical_enabled:
-                        if len(batch) == 6:
-                            x, y6, y, lat, lon, img_id = batch
-                        else:
-                            x, y6, y, lat, lon, img_id, _proxy_t = batch
-                    else:
-                        if len(batch) == 5:
-                            x, y, lat, lon, img_id = batch
-                        else:
-                            x, y, lat, lon, img_id, _proxy_t = batch
-
-                    x = x.to(device, non_blocking=True)
-                    y = y.to(device, non_blocking=True)
-                    if hierarchical_enabled:
+                        x, y6, y, lat, lon, img_id = batch[:6]
+                        x = x.to(device, non_blocking=True)
+                        y = y.to(device, non_blocking=True)
                         y6 = y6.to(device, non_blocking=True)
 
-                    out = model(x)
-                    if hierarchical_enabled:
-                        if num_proxies > 0:
-                            logits_r6, logits_r7, _proxy_pred = out
-                        else:
-                            logits_r6, logits_r7 = out
+                        out = model(x)
+                        if not (isinstance(out, tuple) and len(out) >= 2):
+                            raise RuntimeError("hierarchical_enabled=True but model did not return (logits_r6, logits_r7)")
+                        logits_r6, logits_r7 = out[0], out[1]
+                        if r7_parent_t is None:
+                            raise RuntimeError("hierarchical_enabled=True but r7_parent_t is None")
+
                         _pred_r6, preds, logits_masked = hierarchical_predict(
                             logits_r6,
                             logits_r7,
@@ -468,6 +419,11 @@ def run_training(
                         )
                         logits = logits_masked
                     else:
+                        x, y, lat, lon, img_id = batch[:5]
+                        x = x.to(device, non_blocking=True)
+                        y = y.to(device, non_blocking=True)
+
+                        out = model(x)
                         logits = out[0] if isinstance(out, tuple) else out
                         preds = torch.argmax(logits, dim=1)
 
@@ -500,11 +456,10 @@ def run_training(
                 idx_to_centroid=idx_to_centroid,
             )
 
-            # Per-sample error dump (always) + hardneg pool update
             hard_added = 0
             if len(all_img_ids) == int(targets.numel()) and int(targets.numel()) > 0:
                 val_errors_path = run_dir / "val_errors.parquet"
-                dist_km = _dump_val_errors_parquet(
+                dist_km_arr = _dump_val_errors_parquet(
                     val_errors_path,
                     all_img_ids,
                     targets,
@@ -514,15 +469,12 @@ def run_training(
                     idx_to_centroid,
                 )
 
-                if hard_cfg.enabled and dist_km.size > 0:
-                    new_hard = [all_img_ids[i] for i in range(len(all_img_ids)) if float(dist_km[i]) > hard_cfg.threshold_km]
+                if hard_cfg.enabled and dist_km_arr.size > 0:
+                    new_hard = [all_img_ids[i] for i in range(len(all_img_ids)) if float(dist_km_arr[i]) > hard_cfg.threshold_km]
                     hard_added = len(new_hard)
                     hard_pool_ids = update_pool(hard_pool_ids, new_hard, hard_cfg)
                     save_pool(hard_pool_path, hard_pool_ids)
 
-            # --------------------
-            # Early stop metric selection
-            # --------------------
             if cfg.early_stop_metric == "val_acc":
                 es_value = float(val_acc)
             elif cfg.early_stop_metric == "p90_km":
@@ -532,9 +484,6 @@ def run_training(
             else:
                 raise ValueError("early_stop_metric must be one of: val_acc, p90_km, median_km")
 
-            # --------------------
-            # Log CSV
-            # --------------------
             w.writerow(
                 [
                     epoch,
@@ -560,11 +509,7 @@ def run_training(
             )
             f.flush()
 
-            # --------------------
-            # Checkpoints
-            # --------------------
             torch.save(model.state_dict(), last_ckpt)
-
             if val_acc > best_acc:
                 best_acc = val_acc
                 best_epoch = epoch
@@ -576,24 +521,21 @@ def run_training(
             if kpi.median_km < best_median:
                 best_median = float(kpi.median_km)
 
-            # Dump topk parquet when ES improves
             if _is_improved(es_value, best_es_value, cfg.early_stop_mode, cfg.early_stop_min_delta):
                 best_es_value = es_value
                 out_path = run_dir / "val_topk.parquet"
                 _dump_val_topk_parquet(out_path, all_img_ids, targets, preds, logits_all, k=dump_k)
                 tqdm.write(f"💾 Saved val topk dump: {out_path.resolve()} (k={dump_k})")
 
-            # Console summary
             tag = "geo" if geo_loss is not None else "ce"
-            proxy_tag = f" +proxies(w={proxy_loss_weight:.2f})" if num_proxies > 0 else ""
             hn_tag = f" hardneg(pool={len(hard_pool_ids)},+{hard_added})" if hard_cfg.enabled else ""
             tqdm.write(
                 f"Epoch {epoch:02d} | size={image_size:3d} bs={batch_size:3d} | "
-                f"loss={train_loss:.4f} (main={train_loss_main:.4f} proxy={train_loss_proxy:.4f}) | "
+                f"loss={train_loss:.4f} (main={train_loss_main:.4f}) | "
                 f"val_acc={val_acc:.4f} | top5={val_top5:.4f} top10={val_top10:.4f} | "
                 f"median={kpi.median_km:.2f}km p90={kpi.p90_km:.2f}km | "
                 f"far200={kpi.far_error_rate_200:.3f} far500={kpi.far_error_rate_500:.3f} | "
-                f"{tag}{proxy_tag}{hn_tag}"
+                f"{tag}{hn_tag}"
             )
 
             epoch_pbar.set_postfix(
@@ -604,7 +546,6 @@ def run_training(
                 p90_km=f"{kpi.p90_km:.1f}",
             )
 
-            # Early stopping
             if cfg.early_stopping_enabled:
                 improved = _is_improved(es_value, es_best, cfg.early_stop_mode, cfg.early_stop_min_delta)
                 if improved:

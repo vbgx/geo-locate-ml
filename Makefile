@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 
 # =============================================================================
-# geo-locate-ml — Makefile
+# geo-locate-ml — Makefile (pipeline-safe)
 # =============================================================================
 
 # -----------------------
@@ -27,9 +27,6 @@ MAX_RETRIES_CITY ?= 3
 # -----------------------
 # Download (communes)
 # -----------------------
-# NOTE:
-# - default "download-communes" uses resume runner (batch auto-pick + logs + state)
-# - "download-communes-once" runs a specific CSV batch (no resume)
 COMMUNES_BATCH ?= data/communes/batches/communes_batch_001.csv
 BATCH_DIR ?= data/communes/batches
 STATE_DIR ?= data/state
@@ -39,10 +36,10 @@ PAUSE_BETWEEN_COMMUNES ?= 0
 MIN_PER_COMMUNE ?= 10
 MAX_RETRIES_COMMUNE ?= 3
 
-# forwarded as --sleep (kept aligned with SLEEP)
+# forwarded as --sleep
 DOWNLOADER_SLEEP ?= $(SLEEP)
 
-# aggressive fill behavior (used by ensure_min_images_per_commune_then_download.py)
+# aggressive fill behavior
 FILL_LIMIT ?= 500
 FILL_MIN_NEED ?= 1
 
@@ -110,7 +107,11 @@ help:
 	@echo "  make generate_city_batches                     # regenerate city bboxes/batches"
 	@echo ""
 	@echo "Dataset:"
-	@echo "  make rebuild                                   # build index + splits + sanity"
+	@echo "  make rebuild                                   # build index + splits + merge + sanity"
+	@echo "  make build-index                               # jsonl -> images.parquet (full)"
+	@echo "  make make-splits                               # images.parquet -> splits.parquet"
+	@echo "  make merge-splits                              # images.parquet + splits -> images.parquet + images_kept.parquet + labels.json"
+	@echo "  make sanity                                    # sanity check on images_kept.parquet"
 	@echo ""
 	@echo "Training:"
 	@echo "  make train                                     # run training ($(TRAIN_CMD))"
@@ -148,7 +149,7 @@ help:
 # =============================================================================
 # Safety checks
 # =============================================================================
-.PHONY: check-venv
+.PHONY: check-venv check-tools
 check-venv:
 	@if [ ! -x "$(PY)" ]; then \
 	  echo "ERROR: venv Python not found at $(PY)"; \
@@ -160,10 +161,9 @@ check-venv:
 	  exit 1; \
 	fi
 
-.PHONY: check-tools
 check-tools:
 	@missing=0; \
-	for f in "$(CITY_DOWNLOADER_SH)" "$(COMMUNES_ENSURE_PY)" "$(GEN_CITY_BATCHES_PY)" \
+	for f in "$(CITY_DOWNLOADER_SH)" "$(COMMUNES_RUNNER_SH)" "$(COMMUNES_ENSURE_PY)" "$(GEN_CITY_BATCHES_PY)" \
 	         "$(BUILD_INDEX_PY)" "$(MAKE_SPLITS_PY)" "$(MERGE_SPLITS_PY)" "$(SANITY_PY)" \
 	         "$(EXPORT_SH)" "$(PURGE_RAW_SH)" "$(PIPELINE_ALL_SH)" "$(COMPRESS_PY)"; do \
 	  if [ ! -e "$$f" ]; then echo "ERROR: missing $$f"; missing=1; fi; \
@@ -253,31 +253,33 @@ generate_city_batches: check-venv
 # =============================================================================
 .PHONY: build-index make-splits merge-splits sanity rebuild
 
-# Paths
-BUILD_INDEX_PY ?= tools/dataset/build_index.py
-MAKE_SPLITS_PY ?= tools/dataset/make_splits.py
-MERGE_SPLITS_PY ?= tools/dataset/merge_splits.py
-SANITY_CHECK_PY ?= tools/dataset/sanity_check.py
-
-# Params
-H3_RES ?= 10
-MIN_CELL_SAMPLES ?= 3
-
 build-index: check-venv
+	@echo "Building full index -> data/index/images.parquet"
 	@$(PY) "$(BUILD_INDEX_PY)" --h3-res "$(H3_RES)" --min-cell-samples "$(MIN_CELL_SAMPLES)"
 
 make-splits: check-venv
-	@$(PY) "$(MAKE_SPLITS_PY)" --in-parquet data/index/images.parquet --out-parquet data/index/splits.parquet
+	@echo "Building splits -> data/index/splits.parquet"
+	@$(PY) -m tools.dataset.make_splits \
+	  --in-parquet data/index/images.parquet \
+	  --out-parquet data/index/splits.parquet
 
 merge-splits: check-venv
-	@$(PY) "$(MERGE_SPLITS_PY)"
+	@echo "Merging splits + writing kept-only dataset + labels"
+	@$(PY) -m tools.dataset.merge_splits \
+	  --parquet data/index/images.parquet \
+	  --splits data/index/splits.parquet \
+	  --out data/index/images.parquet \
+	  --out-kept data/index/images_kept.parquet \
+	  --labels-out data/index/labels.json \
+	  --min-cell-samples "$(MIN_CELL_SAMPLES)" \
+	  --drop-missing-files
 
 sanity: check-venv
-	@$(PY) "$(SANITY_CHECK_PY)" --parquet data/index/images.parquet
+	@$(PY) "$(SANITY_PY)" --parquet data/index/images_kept.parquet
 
 rebuild: build-index make-splits merge-splits sanity
 	@echo "✅ rebuild done"
-	
+
 # =============================================================================
 # Train
 # =============================================================================
@@ -332,6 +334,7 @@ tree:
 counts: check-venv
 	@echo "Indexed jsonl lines:" $$(wc -l < data/index/images.jsonl 2>/dev/null || echo 0)
 	@echo "Indexed parquet rows:" $$($(PY) -c "import pathlib; import pandas as pd; p=pathlib.Path('data/index/images.parquet'); print(len(pd.read_parquet(p)) if p.exists() else 0)")
+	@echo "Kept parquet rows:" $$($(PY) -c "import pathlib; import pandas as pd; p=pathlib.Path('data/index/images_kept.parquet'); print(len(pd.read_parquet(p)) if p.exists() else 0)")
 	@echo "On-disk JPG files:" $$(find data/raw/mapillary -type f -name '*.jpg' 2>/dev/null | wc -l | tr -d ' ')
 
 # =============================================================================

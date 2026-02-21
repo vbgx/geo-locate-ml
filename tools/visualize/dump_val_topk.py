@@ -10,6 +10,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.dataset import GeoDataset
+from src.hierarchy import hierarchical_predict
+from src.labels import LabelSpace
 from src.model import MultiScaleCNN
 from src.paths import p
 
@@ -33,8 +35,8 @@ def main():
     labels_path = Path(meta["labels_path"])
     dropout = float(meta.get("dropout", 0.30))
 
-    labels = json.loads(labels_path.read_text(encoding="utf-8"))
-    num_classes = len(labels["h3_ids"])
+    labels = LabelSpace.from_json(labels_path.read_text(encoding="utf-8"))
+    num_classes = len(labels.h3_ids)
 
     ckpt = p("models", "best.pt")
     if not ckpt.exists():
@@ -42,7 +44,9 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ds = GeoDataset(parquet_path, "val", args.image_size)
+    hierarchical_enabled = bool(meta.get("hierarchical_enabled", False))
+
+    ds = GeoDataset(parquet_path, "val", args.image_size, hierarchical_enabled=hierarchical_enabled)
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -51,9 +55,18 @@ def main():
         pin_memory=(device == "cuda"),
     )
 
-    model = MultiScaleCNN(num_classes=num_classes, dropout=dropout).to(device)
+    model = MultiScaleCNN(
+        num_classes=num_classes,
+        dropout=dropout,
+        num_classes_r6=len(labels.h3_ids_r6),
+        hierarchical_enabled=hierarchical_enabled,
+    ).to(device)
     model.load_state_dict(torch.load(ckpt, map_location=device))
     model.eval()
+
+    r7_parent = None
+    if hierarchical_enabled:
+        r7_parent = torch.tensor([labels.r7_to_r6[i] for i in range(len(labels.h3_ids))], dtype=torch.long).to(device)
 
     image_ids: list[str] = []
     true_idx: list[int] = []
@@ -64,24 +77,38 @@ def main():
     k = int(args.k)
 
     for batch in dl:
-        # dataset returns x,y,lat,lon (and possibly image_id in your patched version)
-        if len(batch) == 4:
-            x, y, _lat, _lon = batch
-            # can't dump without image_id -> fallback to row index
-            ids = [None] * x.size(0)
-        elif len(batch) == 5:
-            x, y, _lat, _lon, ids = batch
+        # dataset returns x,y,lat,lon (and optionally image_id / proxy) or hierarchical variant
+        if hierarchical_enabled:
+            if len(batch) == 6:
+                x, y6, y, _lat, _lon, ids = batch
+            else:
+                x, y6, y, _lat, _lon, ids, *_ = batch
         else:
-            # if proxies enabled: x,y,lat,lon,image_id,proxy
-            x, y, _lat, _lon, ids, *_ = batch
+            if len(batch) == 4:
+                x, y, _lat, _lon = batch
+                # can't dump without image_id -> fallback to row index
+                ids = [None] * x.size(0)
+            elif len(batch) == 5:
+                x, y, _lat, _lon, ids = batch
+            else:
+                # if proxies enabled: x,y,lat,lon,image_id,proxy
+                x, y, _lat, _lon, ids, *_ = batch
 
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
         out = model(x)
-        logits = out[0] if isinstance(out, tuple) else out
+        if hierarchical_enabled:
+            if isinstance(out, tuple) and len(out) == 3:
+                logits_r6, logits_r7, _proxy = out
+            else:
+                logits_r6, logits_r7 = out
+            _pred_r6, preds, logits_masked = hierarchical_predict(logits_r6, logits_r7, r7_parent)
+            logits = logits_masked
+        else:
+            logits = out[0] if isinstance(out, tuple) else out
+            preds = torch.argmax(logits, dim=1)
 
-        preds = torch.argmax(logits, dim=1)
         kk = min(k, logits.size(1))
         vals, idxs = torch.topk(logits, k=kk, dim=1)
 

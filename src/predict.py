@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .paths import p
+from .hierarchy import hierarchical_predict
 from .model import MultiScaleCNN
 from .dataset import build_transform
 from .labels import LabelSpace
@@ -30,12 +31,18 @@ def pick_random_from_parquet(parquet_path: str) -> Path:
     return Path(row["path"]), str(row.get("h3_id")), str(row.get("split"))
 
 
+def _ckpt_has_proxy_head(state: dict) -> bool:
+    return any(str(k).startswith("proxy_head.") for k in state.keys())
+
+
+def _ckpt_has_r6_head(state: dict) -> bool:
+    return any(str(k).startswith("fc_r6.") for k in state.keys())
+
+
 @torch.no_grad()
-def predict_probs(model, device, pil_img, size: int):
+def _predict_logits(model, device, pil_img, size: int):
     x = build_transform(size)(pil_img).unsqueeze(0).to(device)
-    logits = model(x)
-    probs = F.softmax(logits, dim=1)[0]
-    return probs
+    return model(x)
 
 
 def topk(classes, probs, k=5):
@@ -130,8 +137,18 @@ def main():
 
     labels = LabelSpace.from_json(labels_path.read_text(encoding="utf-8"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = MultiScaleCNN(num_classes=len(labels.h3_ids), dropout=float(meta.get("dropout", 0.30))).to(device)
-    model.load_state_dict(torch.load(best_pt, map_location=device))
+    state = torch.load(best_pt, map_location=device)
+    num_proxies = 5 if _ckpt_has_proxy_head(state) else 0
+    hierarchical_enabled = bool(meta.get("hierarchical_enabled", False)) or _ckpt_has_r6_head(state)
+
+    model = MultiScaleCNN(
+        num_classes=len(labels.h3_ids),
+        dropout=float(meta.get("dropout", 0.30)),
+        num_proxies=num_proxies,
+        num_classes_r6=len(labels.h3_ids_r6),
+        hierarchical_enabled=hierarchical_enabled,
+    ).to(device)
+    model.load_state_dict(state, strict=True)
     model.eval()
 
     if args.image_path is None:
@@ -146,12 +163,51 @@ def main():
 
     sizes = [int(s.strip()) for s in args.sizes.split(",") if s.strip()]
 
-    if args.ensemble:
-        probs = torch.stack([predict_probs(model, device, pil, s) for s in sizes], dim=0).mean(dim=0)
-        print(f"\nEnsemble sizes: {sizes}")
+    if hierarchical_enabled:
+        r7_parent = torch.tensor([labels.r7_to_r6[i] for i in range(len(labels.h3_ids))], dtype=torch.long).to(device)
+
+        if args.ensemble:
+            logits_r6_list = []
+            logits_r7_list = []
+            for s in sizes:
+                out = _predict_logits(model, device, pil, s)
+                if isinstance(out, tuple) and len(out) == 3:
+                    lr6, lr7, _proxy = out
+                else:
+                    lr6, lr7 = out
+                logits_r6_list.append(lr6)
+                logits_r7_list.append(lr7)
+            logits_r6 = torch.stack(logits_r6_list, dim=0).mean(dim=0)
+            logits_r7 = torch.stack(logits_r7_list, dim=0).mean(dim=0)
+            print(f"\nEnsemble sizes: {sizes}")
+        else:
+            out = _predict_logits(model, device, pil, sizes[-1])
+            if isinstance(out, tuple) and len(out) == 3:
+                logits_r6, logits_r7, _proxy = out
+            else:
+                logits_r6, logits_r7 = out
+            print(f"\nSingle size: {sizes[-1]}")
+
+        pred_r6, _pred_r7, masked = hierarchical_predict(logits_r6, logits_r7, r7_parent)
+        probs = F.softmax(masked, dim=1)[0]
+        print(f"Pred r6: {labels.idx_to_h3_r6[int(pred_r6.item())]}")
     else:
-        probs = predict_probs(model, device, pil, sizes[-1])
-        print(f"\nSingle size: {sizes[-1]}")
+        if args.ensemble:
+            logits_list = []
+            for s in sizes:
+                out = _predict_logits(model, device, pil, s)
+                if isinstance(out, tuple):
+                    out = out[0]
+                logits_list.append(out)
+            logits = torch.stack(logits_list, dim=0).mean(dim=0)
+            print(f"\nEnsemble sizes: {sizes}")
+        else:
+            logits = _predict_logits(model, device, pil, sizes[-1])
+            print(f"\nSingle size: {sizes[-1]}")
+
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        probs = F.softmax(logits, dim=1)[0]
 
     print("\nTop-k (model probs):")
     out = topk(labels.h3_ids, probs, k=args.topk)

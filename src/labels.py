@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import h3
 import pandas as pd

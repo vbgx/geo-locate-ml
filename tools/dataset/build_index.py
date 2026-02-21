@@ -105,12 +105,15 @@ def load_jsonl_keep_all_lines(path: Path) -> List[Tuple[int, Optional[Dict[str, 
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build parquet index from images.jsonl (parity-strict, keep all lines).")
+    ap = argparse.ArgumentParser(
+        description="Build parquet index from images.jsonl (parity-strict, keep all lines). "
+        "Note: min_cell_samples filtering is applied AFTER split in merge_splits.py."
+    )
     ap.add_argument("--jsonl", default=str(JSONL))
     ap.add_argument("--out-parquet", default=str(OUT_PARQUET))
     ap.add_argument("--out-stats", default=str(OUT_STATS))
     ap.add_argument("--h3-res", type=int, required=True)
-    ap.add_argument("--min-cell-samples", type=int, required=True)
+    ap.add_argument("--min-cell-samples", type=int, required=True, help="Recorded in stats; filtering happens after split.")
     ap.add_argument("--prefer-processed", action="store_true", default=True)
     ap.add_argument("--prefer-raw", action="store_true", help="Override: prefer raw over processed")
     args = ap.parse_args()
@@ -241,8 +244,9 @@ def main() -> None:
     cell_counts = df.loc[valid_mask, "h3_id"].value_counts()
 
     df["cell_count"] = df["h3_id"].map(cell_counts).fillna(0).astype(int)
-    df["cell_kept"] = df["cell_count"] >= int(args.min_cell_samples)
-    df["is_kept"] = df["is_valid"].astype(bool) & df["cell_kept"].astype(bool)
+    # NOTE: min_cell_samples filtering is enforced AFTER split in merge_splits.py
+    df["cell_kept"] = df["is_valid"].astype(bool)
+    df["is_kept"] = df["is_valid"].astype(bool)
 
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_parquet, index=False)

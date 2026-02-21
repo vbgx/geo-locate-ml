@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from .dataset import GeoDataset
 from .geo import haversine_km
 from .labels import LabelSpace
+from .hierarchy import hierarchical_predict
 from .model import MultiScaleCNN
 
 
@@ -20,11 +21,22 @@ def _ckpt_has_proxy_head(state: dict) -> bool:
     return any(str(k).startswith("proxy_head.") for k in state.keys())
 
 
-def load_model(ckpt_path: str, num_classes: int, dropout: float, device: str):
+def _ckpt_has_r6_head(state: dict) -> bool:
+    return any(str(k).startswith("fc_r6.") for k in state.keys())
+
+
+def load_model(ckpt_path: str, num_classes: int, num_classes_r6: int, dropout: float, device: str, hierarchical_enabled: bool):
     state = torch.load(ckpt_path, map_location=device)
     num_proxies = 5 if _ckpt_has_proxy_head(state) else 0
+    use_hier = bool(hierarchical_enabled) or _ckpt_has_r6_head(state)
 
-    m = MultiScaleCNN(num_classes=num_classes, dropout=dropout, num_proxies=num_proxies).to(device)
+    m = MultiScaleCNN(
+        num_classes=num_classes,
+        dropout=dropout,
+        num_proxies=num_proxies,
+        num_classes_r6=int(num_classes_r6),
+        hierarchical_enabled=use_hier,
+    ).to(device)
     # strict=True is fine because we matched architecture to checkpoint
     m.load_state_dict(state, strict=True)
     m.eval()
@@ -49,7 +61,15 @@ def confusion_matrix_png(
     y_true: List[int] = []
     y_pred: List[int] = []
 
-    model = load_model(ckpt_path, num_classes=len(labels.h3_ids), dropout=dropout, device=device)
+    model = load_model(
+        ckpt_path,
+        num_classes=len(labels.h3_ids),
+        num_classes_r6=len(labels.h3_ids_r6),
+        dropout=dropout,
+        device=device,
+        hierarchical_enabled=False,
+    )
+    r7_parent = torch.tensor([labels.r7_to_r6[i] for i in range(len(labels.h3_ids))], dtype=torch.long).to(device)
 
     for batch in dl:
         # dataset can return 5-tuple (x,y,lat,lon,image_id) or 6-tuple with proxies
@@ -60,9 +80,16 @@ def confusion_matrix_png(
 
         x = x.to(device, non_blocking=True)
         out = model(x)
-        logits = out[0] if isinstance(out, tuple) else out
-
-        p = torch.argmax(logits, dim=1).cpu().numpy().tolist()
+        if model.hierarchical_enabled:
+            if isinstance(out, tuple) and len(out) == 3:
+                logits_r6, logits_r7, _proxy = out
+            else:
+                logits_r6, logits_r7 = out
+            _pred_r6, preds, _masked = hierarchical_predict(logits_r6, logits_r7, r7_parent)
+            p = preds.cpu().numpy().tolist()
+        else:
+            logits = out[0] if isinstance(out, tuple) else out
+            p = torch.argmax(logits, dim=1).cpu().numpy().tolist()
         y_pred.extend(p)
         y_true.extend(y.numpy().tolist())
 
@@ -112,7 +139,15 @@ def geo_error_plot_png(
     ds = GeoDataset(parquet_path, "val", image_size)
     dl = DataLoader(ds, batch_size=int(batch_size), shuffle=False)
 
-    model = load_model(ckpt_path, num_classes=len(labels.h3_ids), dropout=dropout, device=device)
+    model = load_model(
+        ckpt_path,
+        num_classes=len(labels.h3_ids),
+        num_classes_r6=len(labels.h3_ids_r6),
+        dropout=dropout,
+        device=device,
+        hierarchical_enabled=False,
+    )
+    r7_parent = torch.tensor([labels.r7_to_r6[i] for i in range(len(labels.h3_ids))], dtype=torch.long).to(device)
 
     errors: List[float] = []
     n = 0
@@ -125,8 +160,16 @@ def geo_error_plot_png(
 
         x = x.to(device, non_blocking=True)
         out = model(x)
-        logits = out[0] if isinstance(out, tuple) else out
-        pred = torch.argmax(logits, dim=1).cpu().numpy()
+        if model.hierarchical_enabled:
+            if isinstance(out, tuple) and len(out) == 3:
+                logits_r6, logits_r7, _proxy = out
+            else:
+                logits_r6, logits_r7 = out
+            _pred_r6, preds, _masked = hierarchical_predict(logits_r6, logits_r7, r7_parent)
+            pred = preds.cpu().numpy()
+        else:
+            logits = out[0] if isinstance(out, tuple) else out
+            pred = torch.argmax(logits, dim=1).cpu().numpy()
 
         y_np = y.numpy()
         lat_np = lat.numpy()

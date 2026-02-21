@@ -14,7 +14,7 @@ from .geo import haversine_km
 from .labels import LabelSpace
 from .paths import ensure_dir, p, update_latest_symlink
 from .reporting import plot_metrics_csv
-from .train import run_training
+from .train_loop import run_training
 
 
 def compute_distance_matrix_km(labels: LabelSpace) -> torch.Tensor:
@@ -43,39 +43,39 @@ def _ensure_geo_distance_matrix(run_dir: Path, labels: LabelSpace) -> torch.Tens
     return D
 
 
-def _load_labels_json(path: Path) -> LabelSpace:
+def _load_labels_json_compat(path: Path) -> LabelSpace:
     """
-    Load labels.json produced by tools/dataset/merge_splits.py (kept-only labels).
+    Load labels.json from tools/dataset/merge_splits.py (simple format) OR LabelSpace.to_json format.
 
-    Expected format:
-      {
-        "num_classes": int,
-        "labels": [h3_id, ...],
-        "label_to_idx": {h3_id: idx, ...}
-      }
+    Supports:
+      A) LabelSpace.to_json():
+         { "h3_ids": [...], "h3_to_idx": {...}, "idx_to_h3": {...}, "idx_to_centroid": {...}, ... }
 
-    We reconstruct:
-      - idx_to_h3 (required by LabelSpace)
-      - idx_to_centroid from H3 cell center
+      B) merge_splits.py (simple):
+         { "num_classes": int, "labels": [...], "label_to_idx": {...} }
     """
     obj = json.loads(path.read_text(encoding="utf-8"))
 
-    labels_list = obj.get("labels") or obj.get("h3_ids")
+    # Case A: full LabelSpace format
+    if isinstance(obj, dict) and "h3_ids" in obj and "h3_to_idx" in obj and "idx_to_centroid" in obj:
+        return LabelSpace.from_json(json.dumps(obj))
+
+    # Case B: simple labels file
+    labels_list = obj.get("labels")
     if not isinstance(labels_list, list) or not labels_list:
         raise RuntimeError(f"Invalid labels file: missing 'labels' list: {path}")
 
     labels_list = [str(h) for h in labels_list]
-    idx_to_h3 = [str(h) for h in labels_list]
 
-    # Prefer mapping from file if present (but ensure consistency)
     h3_to_idx_obj = obj.get("label_to_idx")
     if isinstance(h3_to_idx_obj, dict) and h3_to_idx_obj:
         h3_to_idx = {str(k): int(v) for k, v in h3_to_idx_obj.items()}
     else:
         h3_to_idx = {str(h): int(i) for i, h in enumerate(labels_list)}
 
-    # Centroids from H3 cell center
-    import h3 as _h3  # local import to avoid module-level dependency issues in tools
+    idx_to_h3 = {int(i): str(h) for i, h in enumerate(labels_list)}
+
+    import h3 as _h3  # local import
 
     idx_to_centroid: Dict[int, tuple[float, float]] = {}
     for i, h3_id in enumerate(labels_list):
@@ -154,9 +154,7 @@ def main() -> None:
     parquet_full = p(*cfg.parquet_index.split("/"))
     parquet_kept = parquet_full.parent / "images_kept.parquet"
 
-    # Fallback: if images_kept.parquet doesn't exist, train on images.parquet
     parquet_train = parquet_kept if parquet_kept.exists() else parquet_full
-
     if not parquet_train.exists():
         raise FileNotFoundError(
             f"Missing {parquet_train}.\n"
@@ -171,13 +169,12 @@ def main() -> None:
         raise FileNotFoundError(f"Missing {labels_path}. Run: make rebuild (merge-splits step).")
 
     df = pd.read_parquet(parquet_train)
-
     required_cols = {"id", "lat", "lon", "path", "h3_id", "label_idx", "split"}
     missing = sorted(list(required_cols - set(df.columns)))
     if missing:
         raise RuntimeError(f"{parquet_train} missing columns: {missing}")
 
-    labels = _load_labels_json(labels_path)
+    labels = _load_labels_json_compat(labels_path)
 
     C = int(len(labels.h3_ids))
     if C <= 1:
@@ -205,7 +202,7 @@ def main() -> None:
         distance_km=dist_km if cfg.geo_loss_enabled else None,
     )
 
-    plots = plot_metrics_csv(summary.metrics_csv, str(run_dir / "metrics.png"))
+    plots = plot_metrics_csv(summary.metrics_csv, str(run_dir / "metrics"))
     update_latest_symlink(runs_dir, run_dir)
 
     artifacts: Dict[str, Any] = {
@@ -216,7 +213,8 @@ def main() -> None:
         "labels_path": str(labels_path),
         "dist_km_pt": str(run_dir / "dist_km.pt") if (run_dir / "dist_km.pt").exists() else "",
         "metrics_csv": summary.metrics_csv,
-        "metrics_png": plots.get("metrics_png", "") if isinstance(plots, dict) else "",
+        "metrics_loss_png": plots.get("loss_png", "") if isinstance(plots, dict) else "",
+        "metrics_valacc_png": plots.get("valacc_png", "") if isinstance(plots, dict) else "",
         "best_ckpt": summary.best_ckpt,
         "last_ckpt": summary.last_ckpt,
         "num_classes": C,
@@ -241,6 +239,7 @@ def main() -> None:
         "early_stop_metric": cfg.early_stop_metric,
         "num_classes": C,
         "label_idx_max": mx,
+        "hierarchical_enabled": bool(getattr(cfg, "hierarchical_enabled", False)),
     }
 
     _maybe_update_global_best(models_dir, summary.best_ckpt, summary.best_val_acc, meta)

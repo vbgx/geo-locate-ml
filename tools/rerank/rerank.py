@@ -9,8 +9,8 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
-from .geo import haversine_km
-from .data import p
+from src.geo import haversine_km
+from src.paths import p
 
 
 # ============================================================================

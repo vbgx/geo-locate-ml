@@ -1,177 +1,160 @@
-geo-locate-ml — Commands Reference
+# geo-locate-ml — Command Reference
 
-This document lists all operational commands used in the project.
+This document lists the canonical commands to operate the project.
 
-The workflow is:
+The project is organized as:
 
-Build / update dataset
+- `src/` → core runtime (train, predict, report)
+- `tools/` → offline utilities (dataset build, analysis, rerank, reporting)
+- `runs/` → experiment outputs
+- `models/` → global best checkpoint
 
-Train
+---
 
-Normalize run
+# 1️⃣ Dataset Pipeline
 
-Aggregate experiments
+Rebuild dataset index + labels:
 
-Analyze / rerank
+    make rebuild
 
-1. Environment
-1.1 Python
+Or manually:
 
-This project requires:
+    python -m tools.dataset.build_index
+    python -m tools.dataset.make_splits
+    python -m tools.dataset.merge_splits
 
-Python 3.10+
+Expected outputs:
+- data/index/images.parquet
+- data/index/images_kept.parquet
+- data/index/labels.json
 
-torch
+---
 
-torchvision
+# 2️⃣ Train
 
-pandas
+Run a full training experiment:
 
-matplotlib
+    python -m src.run
 
-scikit-learn
+This will:
 
-pyarrow
-
-Verify Python:
-
-python3 --version
-2. Dataset Pipeline
-
-All dataset operations live in tools/.
-
-2.1 Build Index
-python3 tools/dataset/build_index.py
-
-Generates:
-
-data/index/images.parquet
-data/index/splits.parquet
-data/index/labels.json
-2.2 Create Splits
-python3 tools/dataset/make_splits.py
-2.3 Build H3 Feature Table
-python3 tools/pipeline/build_h3_features.py
+- create a new directory in `runs/<timestamp>/`
+- train model
+- compute geo metrics
+- generate plots
+- update `runs/latest`
+- update `models/best.pt` if improved
 
 Outputs:
 
-data/index/h3_features.parquet
-3. Training
+runs/<timestamp>/
+- config.json
+- labels.json
+- images_train.parquet
+- dist_km.pt (if geo_loss enabled)
+- checkpoints/
+- metrics.csv
+- metrics_loss.png
+- metrics_valacc.png
+- REPORT.md
 
-Training is orchestrated by src/run.py.
+---
 
-3.1 Basic Training
-python3 -m src.run
+# 3️⃣ Predict
 
-Or with explicit config overrides:
+Predict on a specific image:
 
-python3 -m src.run \
-  --lr 0.001 \
-  --dropout 0.3 \
-  --image_size 128
-3.2 Enable GeoSoft Loss
-python3 -m src.run \
-  --geo_loss_enabled true \
-  --geo_tau_km 250 \
-  --geo_mix_ce 0.3
-3.3 Enable Hard Negative Mining
-python3 -m src.run \
-  --hardneg_enabled true
-3.4 Enable Hierarchical Prediction
-python3 -m src.run \
-  --hierarchical_enabled true
-4. Runs Management
+    python -m src.predict path/to/image.jpg
 
-Each training produces:
+Predict random sample from training parquet:
 
-runs/<run_id>/
+    python -m src.predict
 
-To normalize all runs into stable artifacts:
+With ensemble over multiple sizes:
 
-python3 tools/reporting/normalize_run.py
+    python -m src.predict path/to/image.jpg --ensemble --sizes 64,128,192
 
-To normalize one specific run:
+---
 
-python3 tools/reporting/normalize_run.py --run-id 2026-02-21_03-36-36
+# 4️⃣ Reports
 
-To move (instead of copy) artifacts into canonical layout:
+Generate run-level report artifacts:
 
-python3 tools/reporting/normalize_run.py --move
-5. Aggregation
+    make report
 
-Aggregate all normalized runs:
+Aggregate all runs into a global dashboard:
 
-python3 tools/reporting/aggregate_runs.py
+    python -m tools.reporting.aggregate_runs
 
 Outputs:
 
-runs/_aggregate/dashboard.html
-runs/_aggregate/runs_summary.csv
-runs/_aggregate/runs_summary.parquet
-6. Unified Reporting (Recommended)
+runs/_aggregate/
+- dashboard.html
+- runs_summary.parquet
+- plots/
 
-Run full pipeline:
+---
 
-make report
+# 5️⃣ Rerank (offline only)
 
-This performs:
+Rerank is NOT part of core runtime.
 
-Normalize runs
+Evaluate feature-based reranking:
 
-Aggregate runs
+    python -m tools.rerank.rerank_eval \
+        --topk_parquet runs/<run_id>/val_topk.parquet \
+        --h3_features data/index/h3_features.parquet
 
-Generate dashboards
+This does not modify models or checkpoints.
+It is analysis-only.
 
-Open:
+---
 
-runs/_aggregate/dashboard.html
-7. Evaluation & Analysis
-7.1 Feature-Based Rerank Evaluation
-python3 -m src.rerank_eval \
-  --topk_parquet runs/<run_id>/artifacts/tables/val_topk.parquet \
-  --h3_features data/index/h3_features.parquet
-7.2 Inspect Hard Errors
-python3 tools/analysis/inspect_top_errors.py
-7.3 Visual Diagnostics
-python3 tools/visualize/map_val_diagnostics.py
-8. Quality Gates
+# 6️⃣ Clean
 
-Compile all source files:
+Remove Python cache:
 
-python3 -m compileall src
+    find . -type d -name "__pycache__" -prune -exec rm -rf {} +
 
-Search for legacy imports:
+Recompile modules:
 
-rg "from \.(dataset|model|geo_loss|class_weights|hardneg|hierarchy|plots) import" -n src
+    python -m compileall src
+    python -m compileall tools
 
-Should return nothing outside _legacy/.
+---
 
-9. Quick Workflow
+# 7️⃣ Git Workflow
 
-Typical iteration:
+Train on feature branch:
 
-# train
-python3 -m src.run
+    git checkout -b feature/xyz
 
-# normalize + aggregate
-make report
+Merge into main:
 
-# open results
-open runs/_aggregate/dashboard.html
-10. Cleaning
+    git checkout main
+    git merge --no-ff feature/xyz
 
-Remove all runs:
+Delete branch:
 
-rm -rf runs/2026-*
+    git branch -d feature/xyz
+    git push origin --delete feature/xyz
 
-Remove aggregate dashboard:
+---
 
-rm -rf runs/_aggregate
-Summary
+# 8️⃣ Debug Checklist
 
-Core commands:
+If `python -m src.run` fails:
 
-python3 -m src.run
-make report
+- Check labels.json exists
+- Check images_kept.parquet exists
+- Verify label_idx max < num_classes
+- Ensure models/best.json format is valid
 
-Everything else is optional tooling.
+---
+
+# 9️⃣ Project Philosophy
+
+- `src/` must remain minimal and stable.
+- No experimental logic inside core.
+- All analysis tools go in `tools/`.
+- `_legacy/` is read-only reference.

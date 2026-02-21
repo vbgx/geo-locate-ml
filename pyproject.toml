@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geo-locate-ml"
+version = "0.1.0"
+description = "Geolocate photos from Mapillary imagery using H3 cells and distance-aware training."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Victor" }]
+
+dependencies = [
+  # Core
+  "numpy>=1.26",
+  "pillow>=10.0",
+  "requests>=2.31",
+  "tqdm>=4.66",
+  "python-dotenv>=1.0",
+
+  # Data / indexing
+  "pandas>=2.2",
+  "pyarrow>=15.0",
+  "h3>=4.0",
+
+  # ML
+  "torch>=2.2",
+  "torchvision>=0.17",
+
+  # Metrics / plots
+  "scikit-learn>=1.4",
+  "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6",
+  "pytest>=8.0",
+  "ipykernel>=6.29",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-select = ["I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

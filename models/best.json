@@ -1,0 +1,17 @@
+{
+  "best_val_acc": 0.6855840682983398,
+  "timestamp": "2026-02-20_20-34-45",
+  "run_dir": "/Users/victorbergeroux/Desktop/geo-locate-ml/runs/2026-02-20_20-34-45",
+  "labels_path": "/Users/victorbergeroux/Desktop/geo-locate-ml/runs/2026-02-20_20-34-45/labels.json",
+  "parquet_path": "/Users/victorbergeroux/Desktop/geo-locate-ml/data/index/images.parquet",
+  "dropout": 0.3,
+  "geo_loss_enabled": true,
+  "geo_tau_km": 1.8,
+  "geo_mix_ce": 0.45,
+  "best_geo_median_km": 1.0491591113836898,
+  "best_geo_p90_km": 457.378942468561,
+  "early_stopping_enabled": true,
+  "early_stop_metric": "median_km",
+  "num_classes": 370,
+  "label_idx_max": 369
+}

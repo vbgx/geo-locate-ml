@@ -10,11 +10,11 @@ import torch
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 from torch.utils.data import DataLoader
 
-from .dataset import GeoDataset
+from .data import GeoDataset
 from .geo import haversine_km
 from .labels import LabelSpace
-from .hierarchy import hierarchical_predict
-from .model import MultiScaleCNN
+from .geo import hierarchical_predict
+from .modeling import MultiScaleCNN
 
 
 def _ckpt_has_proxy_head(state: dict) -> bool:

@@ -1,281 +1,328 @@
-# geo-locate-ml — Architecture Overview
+geo-locate-ml — Architecture
+1. Overview
 
-This document describes the technical architecture of the project.
+geo-locate-ml is a structured computer vision system for large-scale geo-localization.
 
-The system predicts the geographic location of an image using supervised learning on Mapillary street-level imagery.
+The system predicts an H3 cell (r7) from a single image, with:
 
----
+Optional hierarchical prediction (r6 → r7 masking)
 
-# 1. High-Level Pipeline
+Optional geo-aware loss (distance-soft targets)
 
-The project follows a deterministic data → training → export pipeline:
+Hard-negative mining (tail improvement)
 
-1. Image acquisition (Mapillary API)
-2. Dataset indexing (H3 spatial binning)
-3. Train/validation/test split (sequence-aware)
-4. Model training
-5. Evaluation (accuracy + geographic metrics)
-6. Snapshot export
-7. Optional raw image cleanup
+Feature-based reranking (post-hoc)
 
-All steps are reproducible from the command line.
+Fully normalized run artifacts + reporting system
 
----
+The project is designed around:
 
-# 2. Data Layer
+Deterministic training runs
 
-## 2.1 Raw Images
+Stable run artifacts
 
-Location:
+Aggregatable experiment tracking
 
-data/raw/mapillary/
+Minimal module duplication
 
+2. High-Level Architecture
+                ┌───────────────────────┐
+                │     Data Layer        │
+                │  (Parquet + H3 index) │
+                └─────────────┬─────────┘
+                              │
+                              ▼
+                ┌───────────────────────┐
+                │     Modeling Layer    │
+                │  CNN + GeoSoftLoss    │
+                └─────────────┬─────────┘
+                              │
+                              ▼
+                ┌───────────────────────┐
+                │     Training Loop     │
+                │  hardneg + hierarchy  │
+                └─────────────┬─────────┘
+                              │
+                              ▼
+                ┌───────────────────────┐
+                │     Run Artifacts     │
+                │  summary + dashboard  │
+                └─────────────┬─────────┘
+                              │
+                              ▼
+                ┌───────────────────────┐
+                │  Global Aggregation   │
+                │  multi-criteria rank  │
+                └───────────────────────┘
+3. Source Code Structure (src/)
 
-Contains downloaded `.jpg` files from Mapillary.
+All runtime logic lives under src/.
 
-Raw images are temporary and can be safely deleted after training.
+3.1 Data Layer
 
----
+src/data.py
 
-## 2.2 Index (Canonical Dataset State)
+Responsibilities:
 
-Location:
+GeoDataset
 
-data/index/
+Train/val split loading
 
+Parquet reading
 
-Files:
+Transform builder
 
-- `images.jsonl` → raw metadata
-- `images.parquet` → structured dataset
-- `splits.parquet` → train/val/test assignment
-- `stats.json` → dataset statistics
+Label index handling
 
-This folder defines the current dataset state.
+This is the single source of truth for dataset logic.
 
----
+3.2 Modeling Layer
 
-# 3. Spatial Representation
-
-## 3.1 H3 Grid
-
-The Earth surface is discretized using H3 hexagonal cells.
-
-Parameters:
-- `h3_resolution`
-- `min_cell_samples`
-
-Each image is assigned to an H3 cell.
-Each H3 cell becomes a classification class.
-
-This converts geographic regression into classification over spatial bins.
-
----
-
-# 4. Splitting Strategy
-
-Splits are **sequence-aware**:
-
-- Images from the same Mapillary sequence
-- Never appear in multiple splits
-
-This prevents leakage across train/validation/test.
-
-Ratios:
-- 80% train
-- 15% validation
-- 5% test
-
----
-
-# 5. Model Architecture
-
-Defined in:
-
-src/model.py
-
-
-Current design:
-- CNN backbone
-- Dropout regularization
-- Final classification layer over H3 cells
-
-The architecture is intentionally lightweight to:
-- Allow CPU training
-- Support incremental dataset growth
-- Avoid overfitting on small batches
-
----
-
-# 6. Training System
-
-Entry point:
-
-python -m src.run
-
-
-Core components:
-- `dataset.py`
-- `train.py`
-- `geo_loss.py`
-- `metrics_geo.py`
-
-## 6.1 Loss Functions
-
-Two modes:
-
-### 1. Cross-Entropy
-Standard classification loss.
-
-### 2. Distance-Aware Loss (optional)
-
-Encourages geographically closer predictions by:
-
-- Computing distance between predicted cell centroid and ground-truth coordinates
-- Applying exponential distance weighting (`geo_tau_km`)
-- Mixing with cross-entropy (`geo_mix_ce`)
-
-This improves geographic realism.
-
----
-
-# 7. Metrics
-
-Training reports:
-
-- Validation accuracy
-- Median geographic error (km)
-- 90th percentile error (km)
-
-Why:
-
-Accuracy alone does not reflect geographic quality.
-Distance metrics measure real-world usefulness.
-
----
-
-# 8. Artifacts
-
-## 8.1 Training Runs
-
-Location:
-
-runs/<timestamp>/
-
+src/modeling.py
 
 Contains:
-- checkpoints
-- plots
-- metrics.csv
-- REPORT.md
 
-A symlink:
+MultiScaleCNN
 
-runs/latest
+GeoSoftTargetLoss
 
-Points to most recent run.
+compute_class_weights_from_parquet
 
----
+No duplicate model definitions elsewhere.
 
-## 8.2 Global Best Model
+3.3 Geo & Hierarchical Logic
 
-Location:
+src/geo.py
 
-models/best.pt
-models/best.json
+Contains:
 
+haversine_km
 
-Updated only when performance improves.
+hierarchical_predict
 
----
+mask_r7_logits
 
-## 8.3 Snapshots
+HardNegConfig
 
-Location:
+Hard-negative pool utilities
 
-exports/
+This module centralizes:
 
+spatial logic
 
-Each snapshot contains:
-- Run artifacts
-- Dataset index
-- Best model at that time
+hierarchical masking
 
-Snapshots are immutable.
+hard negative mechanics
 
----
+3.4 Training
 
-# 9. Automation Layer
+src/train_loop.py
 
-Controlled by:
+Responsibilities:
 
+Full training loop
 
-Makefile
+Loss selection (CE / GeoSoft)
 
+Hard-negative oversampling
 
-Main flows:
-- `make download`
-- `make rebuild`
-- `make train`
-- `make export`
-- `make batch`
-- `make loop`
+Hierarchical masking
 
-The Makefile ensures reproducible execution.
+Metrics logging
 
----
+src/run.py orchestrates:
 
-# 10. Storage Strategy
+Config parsing
 
-Images are large.
-Index files are small.
+Model creation
 
-Design principle:
-- Raw images are disposable.
-- Index + model artifacts are persistent.
+Train invocation
 
-This allows incremental dataset growth without disk exhaustion.
+Artifact generation
 
----
+3.5 Reporting
 
-# 11. Design Philosophy
+src/reporting.py
 
-The system prioritizes:
+Generates:
 
-- Reproducibility
-- Determinism
-- Geographic realism
-- Controlled disk usage
-- Clear separation between data, training, and artifacts
+metrics_loss.png
 
-It is designed to scale gradually from:
-- 10k images
-- to 100k+
-- to multi-region datasets
+metrics_valacc.png
 
-without changing core architecture.
+geo_error.png
 
----
+confusion_matrix.png
 
-# 12. Future Extensions
+No plotting logic outside this module.
 
-Possible evolution paths:
+3.6 Reranking
 
-- Higher H3 resolution (finer localization)
-- Backbone upgrades (ResNet / ViT)
-- Pretrained initialization
-- Regression over lat/lon instead of classification
-- Multi-scale spatial modeling
-- Embedding-based nearest neighbor inference
+src/rerank.py
 
----
+Contains:
 
-# 13. Summary
+Prior-based reranking
 
-The project is structured as:
+Feature-based gated reranking
 
-Data acquisition → Spatial indexing → Supervised training → Geographic evaluation → Snapshot export
+Evaluation logic
 
-Each layer is isolated and replaceable.
+Designed to improve tail (P90/P95) without breaking median.
 
+4. Runs Architecture
 
+Each training run is fully self-contained.
+
+runs/<run_id>/
+  summary.json
+  dashboard.html
+  artifacts/
+    plots/
+    tables/
+    data/
+  checkpoints/
+  config.json
+  REPORT.md
+4.1 summary.json
+
+Compact, comparable across runs.
+Contains:
+
+best_val_acc
+
+best_p90_km
+
+last metrics
+
+config subset
+
+artifact flags
+
+Stable schema.
+
+4.2 dashboard.html
+
+Single-page visual overview:
+
+Key metrics
+
+Plots
+
+Artifact links
+
+Human-readable experiment page.
+
+5. Aggregation Layer
+
+tools/reporting/aggregate_runs.py
+
+Reads all:
+
+runs/<run_id>/summary.json
+
+Generates:
+
+runs/_aggregate/
+  runs_summary.csv
+  runs_summary.parquet
+  dashboard.html
+
+Ranking is multi-criteria:
+
+Score combines:
+
+best_val_acc (higher better)
+
+best_p90_km (lower better)
+
+last_geo_median_km (lower better)
+
+penalties for missing artifacts
+
+This allows rational experiment comparison.
+
+6. Data Architecture
+data/
+  raw/              # unprocessed Mapillary
+  processed/        # cleaned images
+  index/            # canonical parquet + H3 features
+  external/         # DEM, coastline, worldcover
+  state/            # pipeline progress
+
+The index folder is canonical:
+
+images.parquet
+
+splits.parquet
+
+h3_features.parquet
+
+labels.json
+
+No duplication elsewhere.
+
+7. Design Principles
+7.1 One Source of Truth
+
+Model defined once
+
+Dataset defined once
+
+Geo logic defined once
+
+No duplicated logic in legacy files
+
+7.2 Run = Product
+
+Each run is:
+
+Reproducible
+
+Self-contained
+
+Inspectable
+
+Comparable
+
+7.3 Strict Separation
+
+Runtime → src/
+
+Tooling → tools/
+
+Data → data/
+
+Experiments → runs/
+
+8. Future Evolution
+
+Potential improvements:
+
+Lightning/Fabric migration
+
+WandB-style online tracking (optional)
+
+Spatial attention backbone
+
+Better feature rerank gating
+
+Automated hyperparameter sweeps
+
+Dataset balancing strategies
+
+9. Summary
+
+geo-locate-ml is structured as:
+
+A clean modular ML system
+
+With deterministic training
+
+With stable experiment artifacts
+
+With multi-run rational ranking
+
+With zero duplicated core logic
+
+The repository is organized to minimize architectural drift and maximize long-term maintainability.

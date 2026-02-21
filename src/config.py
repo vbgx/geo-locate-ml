@@ -47,12 +47,12 @@ class TrainConfig:
     # --------------------------------------------------
     image_sizes: Tuple[int, ...] = (128,)
     batch_sizes: Tuple[int, ...] = (32,)
-    epochs: int = 1
+    epochs: int = 30
 
     lr: float = 1e-3
     weight_decay: float = 1e-4
     dropout: float = 0.30
-    num_workers: int = 2
+    num_workers: int = 3
 
     # --------------------------------------------------
     # Distance-aware loss (geo)
@@ -67,7 +67,7 @@ class TrainConfig:
     # --------------------------------------------------
     # Hard-negative mining (tail reducer)
     # --------------------------------------------------
-    hardneg_enabled: bool = False
+    hardneg_enabled: bool = True
     hardneg_threshold_km: float = 500.0
     hardneg_boost: float = 2.0
     hardneg_max_pool: int = 20000

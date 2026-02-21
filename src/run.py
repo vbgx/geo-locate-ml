@@ -13,7 +13,7 @@ from .config import TrainConfig
 from .geo import haversine_km
 from .labels import LabelSpace
 from .paths import ensure_dir, p, update_latest_symlink
-from .plots import plot_metrics_csv
+from .reporting import plot_metrics_csv
 from .train import run_training
 
 

@@ -9,9 +9,9 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .paths import p
-from .hierarchy import hierarchical_predict
-from .model import MultiScaleCNN
-from .dataset import build_transform
+from .geo import hierarchical_predict
+from .modeling import MultiScaleCNN
+from .data import build_transform
 from .labels import LabelSpace
 
 

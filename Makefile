@@ -9,7 +9,7 @@ SHELL := /bin/bash
 # -----------------------
 # Interpreter (always use venv)
 # -----------------------
-PY ?= .venv/bin/python
+PY ?= .venv/bin/python3
 
 # -----------------------
 # Mode: communes (default) or cities
@@ -329,7 +329,7 @@ sizes:
 
 tree:
 	@command -v tree >/dev/null 2>&1 || { echo "tree not installed (brew install tree)"; exit 1; }
-	@tree -I "data/raw|data/processed|__pycache__|*.egg-info|.venv|*.jpg"
+	@tree -I "data/raw|data/processed|__pycache__|*.egg-info|.venv|*.jpg|*.csv|*tif"
 
 counts: check-venv
 	@echo "Indexed jsonl lines:" $$(wc -l < data/index/images.jsonl 2>/dev/null || echo 0)
@@ -386,3 +386,23 @@ loop: check-venv
 # =============================================================================
 .PHONY: default
 default: help
+
+.PHONY: report report-clean
+
+report:
+	@echo "==> Normalize runs ..."
+	python3 tools/reporting/normalize_run.py
+	@echo "==> Aggregate runs ..."
+	python3 tools/reporting/aggregate_runs.py
+	@echo ""
+	@echo "✅ Done."
+	@echo "Open: runs/_aggregate/dashboard.html"
+
+report-clean:
+	@echo "==> Normalize runs (MOVE mode) ..."
+	python3 tools/reporting/normalize_run.py --move
+	@echo "==> Aggregate runs ..."
+	python3 tools/reporting/aggregate_runs.py
+	@echo ""
+	@echo "✅ Done."
+	@echo "Open: runs/_aggregate/dashboard.html"

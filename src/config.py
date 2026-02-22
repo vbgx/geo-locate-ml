@@ -54,7 +54,7 @@ class TrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     dropout: float = 0.30
-    num_workers: int = 8
+    num_workers: int = 6
 
     # --------------------------------------------------
     # Distance-aware loss (geo)
@@ -111,11 +111,11 @@ class TrainConfig:
     # --------------------------------------------------
     # Backwards-compatible: proxy learning stays OFF unless:
     #   proxy_loss_enabled=True AND proxy_loss_weight>0
-    proxy_loss_enabled: bool = False
+    proxy_loss_enabled: bool = True
 
     # scalar multiplier applied in train_loop:
     #   loss = loss_main + proxy_loss_weight * proxy_loss
-    proxy_loss_weight: float = 0.0
+    proxy_loss_weight: float = 2.0
 
     # Which columns to read from the training parquet when proxy loss is enabled.
     # Default matches build_proxies.py output.

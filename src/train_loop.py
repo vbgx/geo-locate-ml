@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -148,6 +149,118 @@ def _dump_val_errors_parquet(
     return dist
 
 
+def _is_str_list(x: Any) -> bool:
+    if isinstance(x, list) and (len(x) == 0 or isinstance(x[0], str)):
+        return True
+    if isinstance(x, tuple) and (len(x) == 0 or isinstance(x[0], str)):
+        return True
+    return False
+
+
+def _to_1d_float_tensor(x: Any) -> Optional[torch.Tensor]:
+    """
+    Convert a batch field to a 1D float tensor if plausible, else None.
+    Accepts torch tensors, numpy arrays, python lists.
+    """
+    try:
+        if torch.is_tensor(x):
+            t = x
+        else:
+            t = torch.as_tensor(x)
+        if t.numel() == 0:
+            return None
+        if not (t.dtype.is_floating_point or t.dtype in (torch.int16, torch.int32, torch.int64, torch.uint8)):
+            return None
+        t = t.detach()
+        if t.dim() == 1:
+            return t.float()
+        if t.dim() == 2 and t.size(1) == 1:
+            return t[:, 0].float()
+        return None
+    except Exception:
+        return None
+
+
+def _looks_like_lat(t: torch.Tensor) -> bool:
+    if t.numel() == 0:
+        return False
+    vmin = float(t.min().cpu())
+    vmax = float(t.max().cpu())
+    return (vmin >= -90.5) and (vmax <= 90.5)
+
+
+def _looks_like_lon(t: torch.Tensor) -> bool:
+    if t.numel() == 0:
+        return False
+    vmin = float(t.min().cpu())
+    vmax = float(t.max().cpu())
+    return (vmin >= -180.5) and (vmax <= 180.5)
+
+
+def _extract_lat_lon_img_id(batch: Sequence[Any], *, B: int) -> tuple[torch.Tensor, torch.Tensor, List[str]]:
+    """
+    Robustly find (lat, lon, img_id) regardless of proxy insertion/order.
+    - img_id: first list/tuple[str] when scanning from the end.
+    - lat/lon: two 1D numeric tensors length B with plausible ranges.
+    """
+    img_id: List[str] = []
+    for x in reversed(batch):
+        if _is_str_list(x):
+            img_id = [str(s) for s in x]
+            break
+    if not img_id:
+        last = batch[-1]
+        if torch.is_tensor(last) and last.dim() == 1 and int(last.numel()) == int(B):
+            img_id = [str(int(v)) for v in last.detach().cpu().tolist()]
+        else:
+            img_id = [f"val_{i:08d}" for i in range(B)]
+
+    cands: List[torch.Tensor] = []
+    for x in batch:
+        t = _to_1d_float_tensor(x)
+        if t is None:
+            continue
+        if int(t.numel()) != int(B):
+            continue
+        cands.append(t)
+
+    lat_t: Optional[torch.Tensor] = None
+    lon_t: Optional[torch.Tensor] = None
+    for t in cands:
+        if lat_t is None and _looks_like_lat(t):
+            lat_t = t
+            continue
+        if lon_t is None and _looks_like_lon(t):
+            lon_t = t
+            continue
+
+    if lat_t is None or lon_t is None:
+        dbg: List[str] = []
+        for i, x in enumerate(batch):
+            if torch.is_tensor(x):
+                dbg.append(f"{i}: tensor shape={tuple(x.shape)} dtype={x.dtype}")
+            elif _is_str_list(x):
+                dbg.append(f"{i}: str_list len={len(x)}")
+            else:
+                dbg.append(f"{i}: {type(x).__name__}")
+        raise RuntimeError("Could not infer lat/lon from batch. Batch layout:\n" + "\n".join(dbg))
+
+    return lat_t, lon_t, img_id
+
+
+def _masked_smooth_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """SmoothL1 with per-element mask (0/1). Returns a scalar."""
+    if pred.shape != target.shape:
+        raise RuntimeError(f"proxy pred/target shape mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}")
+    if mask.shape != target.shape:
+        raise RuntimeError(f"proxy mask shape mismatch: mask={tuple(mask.shape)} target={tuple(target.shape)}")
+    diff = torch.nn.functional.smooth_l1_loss(pred, target, reduction="none")
+    diff = diff * mask
+    denom = mask.sum().clamp(min=1.0)
+    return diff.sum() / denom
+
+
+
 def _stats(t: torch.Tensor) -> str:
     t0 = t.detach()
     return f"shape={tuple(t0.shape)} min={float(t0.min().cpu()):.4f} max={float(t0.max().cpu()):.4f}"
@@ -191,7 +304,7 @@ def run_training(
     idx_to_centroid: Dict[int, Tuple[float, float]],
     distance_km: Optional[torch.Tensor] = None,
     *,
-    num_proxies: int = 0,
+    num_proxies: int = 1,
     num_classes_r6: int = 0,
     r7_parent: Optional[torch.Tensor] = None,
 ) -> TrainSummary:
@@ -217,14 +330,12 @@ def run_training(
     if proxy_loss_enabled and len(proxy_cols) != num_proxies:
         raise RuntimeError(f"proxy_cols length mismatch: len(proxy_cols)={len(proxy_cols)} num_proxies={num_proxies}")
 
-    # dump topk
     dump_k = int(getattr(cfg, "dump_topk", 10))
     dump_k = max(dump_k, 10)
     dump_k = max(dump_k, int(getattr(cfg, "topk", 5)))
 
     proxy_loss_weight = float(getattr(cfg, "proxy_loss_weight", 0.35)) if proxy_loss_enabled else 0.0
 
-    # hard neg
     hard_cfg = HardNegConfig(
         enabled=bool(getattr(cfg, "hardneg_enabled", False)),
         threshold_km=float(getattr(cfg, "hardneg_threshold_km", 500.0)),
@@ -235,7 +346,6 @@ def run_training(
     hard_pool_path = run_dir / "hardneg_pool.json"
     hard_pool_ids = load_pool(hard_pool_path)
 
-    # model
     model = MultiScaleCNN(
         num_classes=int(num_classes),
         dropout=float(cfg.dropout),
@@ -250,7 +360,6 @@ def run_training(
         weight_decay=float(cfg.weight_decay),
     )
 
-    # Losses
     class_w = compute_class_weights_from_parquet(
         parquet_path,
         split="train",
@@ -278,12 +387,10 @@ def run_training(
             tau_km=float(getattr(cfg, "geo_tau_km", 1.8)),
         )
 
-    # proxy loss (regression on z-scored proxies; assumes dataset returns proxy vector when enabled)
     proxy_loss_fn: Optional[nn.Module] = None
     if proxy_loss_enabled:
         proxy_loss_fn = nn.SmoothL1Loss(reduction="mean")
 
-    # checkpoints
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_ckpt = ckpt_dir / "best.pt"
@@ -345,6 +452,7 @@ def run_training(
                 "train",
                 image_size,
                 hierarchical_enabled=hierarchical_enabled,
+                proxies_enabled=bool(proxy_loss_enabled),
                 proxy_columns=proxy_cols if proxy_loss_enabled else None,
             )
             val_ds = GeoDataset(
@@ -352,6 +460,7 @@ def run_training(
                 "val",
                 image_size,
                 hierarchical_enabled=hierarchical_enabled,
+                proxies_enabled=bool(proxy_loss_enabled),
                 proxy_columns=proxy_cols if proxy_loss_enabled else None,
             )
 
@@ -401,36 +510,34 @@ def run_training(
 
             for batch in train_pbar:
                 if hierarchical_enabled:
-                    # expected: x, y6, y7, lat, lon, img_id, (optional proxy)
-                    x, y6, y7, _lat, _lon, _img_id = batch[:6]
-                    proxy_t = None
-                    if proxy_loss_enabled:
-                        proxy_t = batch[6]
+                    # Expected minimal layout:
+                    # (x, y6, y7, lat, lon, ..., img_id)
+                    x = batch[0]
+                    y6 = batch[1]
+                    y = batch[2]
                     x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
                     y6 = y6.to(device, non_blocking=True)
-                    y7 = y7.to(device, non_blocking=True)
-                    if proxy_t is not None:
-                        proxy_t = proxy_t.to(device, non_blocking=True).float()
                 else:
-                    # expected: x, y7, lat, lon, img_id, (optional proxy)
-                    x, y7, _lat, _lon, _img_id = batch[:5]
-                    proxy_t = None
-                    if proxy_loss_enabled:
-                        proxy_t = batch[5]
+                    # Expected minimal layout:
+                    # (x, y7, lat, lon, ..., img_id)
+                    x = batch[0]
+                    y = batch[1]
                     x = x.to(device, non_blocking=True)
-                    y7 = y7.to(device, non_blocking=True)
-                    if proxy_t is not None:
-                        proxy_t = proxy_t.to(device, non_blocking=True).float()
+                    y = y.to(device, non_blocking=True)
+
+                proxy_t = None
+                proxy_m = None
+                if proxy_loss_enabled:
+                    # Dataset appends (proxy_targets, proxy_mask) at the end of each sample.
+                    proxy_t = batch[-2].to(device, non_blocking=True).float()
+                    proxy_m = batch[-1].to(device, non_blocking=True).float()
 
                 optimizer.zero_grad(set_to_none=True)
-
                 out = model(x)
 
                 proxy_pred = None
 
-                # --------------------
-                # Main loss (classification)
-                # --------------------
                 if hierarchical_enabled:
                     if not (isinstance(out, tuple) and len(out) >= 2):
                         raise RuntimeError("hierarchical_enabled=True but model did not return (logits_r6, logits_r7)")
@@ -447,15 +554,14 @@ def run_training(
 
                     loss_r6 = ce_r6(logits_r6, y6)
 
-                    # allowed classes = those whose parent == y6
-                    allowed_mask = r7_parent_t.unsqueeze(0).eq(y6.unsqueeze(1))  # [B,C] bool
+                    allowed_mask = r7_parent_t.unsqueeze(0).eq(y6.unsqueeze(1))  # [B,C]
                     logits_r7_masked = logits_r7.masked_fill(~allowed_mask, -1e9)
 
                     if geo_loss is None:
-                        loss_r7 = ce(logits_r7_masked, y7)
+                        loss_r7 = ce(logits_r7_masked, y)
                     else:
-                        loss_geo = geo_loss(logits_r7_masked, y7, allowed_mask=allowed_mask)
-                        loss_ce = ce(logits_r7_masked, y7)
+                        loss_geo = geo_loss(logits_r7_masked, y, allowed_mask=allowed_mask)
+                        loss_ce = ce(logits_r7_masked, y)
                         loss_r7 = (1.0 - float(cfg.geo_mix_ce)) * loss_geo + float(cfg.geo_mix_ce) * loss_ce
 
                     loss_main = loss_r6 + loss_r7
@@ -479,10 +585,10 @@ def run_training(
                         logits = out
 
                     if geo_loss is None:
-                        loss_main = ce(logits, y7)
+                        loss_main = ce(logits, y)
                     else:
-                        loss_geo = geo_loss(logits, y7)
-                        loss_ce = ce(logits, y7)
+                        loss_geo = geo_loss(logits, y)
+                        loss_ce = ce(logits, y)
                         loss_main = (1.0 - float(cfg.geo_mix_ce)) * loss_geo + float(cfg.geo_mix_ce) * loss_ce
 
                     _debug_first_batch(
@@ -493,16 +599,13 @@ def run_training(
                         logits_r7=logits,
                     )
 
-                # --------------------
-                # Proxy loss (optional)
-                # --------------------
                 loss_proxy = torch.tensor(0.0, device=device)
                 if proxy_loss_enabled:
                     if proxy_loss_fn is None:
                         raise RuntimeError("proxy_loss_enabled=True but proxy_loss_fn is None")
                     if proxy_pred is None or proxy_t is None:
                         raise RuntimeError("proxy_loss_enabled=True but missing proxy_pred/proxy_t")
-                    loss_proxy = proxy_loss_fn(proxy_pred, proxy_t)
+                    loss_proxy = _masked_smooth_l1(proxy_pred, proxy_t, proxy_m)
 
                 loss = loss_main + float(proxy_loss_weight) * loss_proxy
 
@@ -548,10 +651,17 @@ def run_training(
             with torch.no_grad():
                 for batch in val_pbar:
                     if hierarchical_enabled:
-                        x, y6, y7, lat, lon, img_id = batch[:6]
+                        x = batch[0]
+                        y6 = batch[1]
+                        y = batch[2]
                         x = x.to(device, non_blocking=True)
+                        y = y.to(device, non_blocking=True)
                         y6 = y6.to(device, non_blocking=True)
-                        y7 = y7.to(device, non_blocking=True)
+
+                        B = int(y.numel())
+                        lat, lon, img_id = _extract_lat_lon_img_id(batch, B=B)
+                        lat = lat.to(device, non_blocking=True)
+                        lon = lon.to(device, non_blocking=True)
 
                         out = model(x)
                         if not (isinstance(out, tuple) and len(out) >= 2):
@@ -570,9 +680,15 @@ def run_training(
                         )
                         logits = logits_masked
                     else:
-                        x, y7, lat, lon, img_id = batch[:5]
+                        x = batch[0]
+                        y = batch[1]
                         x = x.to(device, non_blocking=True)
-                        y7 = y7.to(device, non_blocking=True)
+                        y = y.to(device, non_blocking=True)
+
+                        B = int(y.numel())
+                        lat, lon, img_id = _extract_lat_lon_img_id(batch, B=B)
+                        lat = lat.to(device, non_blocking=True)
+                        lon = lon.to(device, non_blocking=True)
 
                         out = model(x)
                         logits = out[0] if isinstance(out, tuple) else out
@@ -580,12 +696,12 @@ def run_training(
 
                     all_logits.append(logits.detach().cpu())
                     all_preds.append(preds.detach().cpu())
-                    all_targets.append(y7.detach().cpu())
-                    all_lat.append(lat.detach().cpu())
-                    all_lon.append(lon.detach().cpu())
+                    all_targets.append(y.detach().cpu())
+                    all_lat.append(lat.reshape(-1).detach().cpu())
+                    all_lon.append(lon.reshape(-1).detach().cpu())
                     all_img_ids.extend([str(s) for s in img_id])
 
-                    batch_acc = float((preds == y7.detach().cpu()).float().mean().item())
+                    batch_acc = float((preds == y.detach().cpu()).float().mean().item())
                     val_pbar.set_postfix(acc=f"{batch_acc:.3f}")
 
             logits_all = (
@@ -594,23 +710,52 @@ def run_training(
             preds = torch.cat(all_preds, dim=0) if all_preds else torch.empty((0,), dtype=torch.long)
             targets = torch.cat(all_targets, dim=0) if all_targets else torch.empty((0,), dtype=torch.long)
 
-            lat_true = torch.cat(all_lat, dim=0).numpy() if all_lat else np.array([], dtype=np.float32)
-            lon_true = torch.cat(all_lon, dim=0).numpy() if all_lon else np.array([], dtype=np.float32)
+            # ---- Robust lat/lon handling (proxies may change batch layout) ----
+            N = int(targets.numel())
+            if all_lat and all_lon:
+                lat_true = torch.cat(all_lat, dim=0).reshape(-1).numpy()
+                lon_true = torch.cat(all_lon, dim=0).reshape(-1).numpy()
+            else:
+                lat_true = np.array([], dtype=np.float32)
+                lon_true = np.array([], dtype=np.float32)
+
+            geo_ok = True
+            if N > 0:
+                if lat_true.size != N or lon_true.size != N:
+                    geo_ok = False
+                    tqdm.write(
+                        "⚠️  Geo metrics skipped: lat/lon missing or mismatch "
+                        f"(lat={int(lat_true.size)} lon={int(lon_true.size)} vs y_true={N}). "
+                        "This usually means the batch layout changed (e.g. proxies inserted) "
+                        "and lat/lon were not extracted correctly."
+                    )
 
             val_acc = _accuracy(preds, targets)
             val_top5 = _topk_accuracy(logits_all, targets, k=5)
             val_top10 = _topk_accuracy(logits_all, targets, k=10)
 
-            kpi = compute_geo_kpi(
-                y_true=targets.numpy() if targets.numel() else np.array([], dtype=np.int64),
-                y_pred=preds.numpy() if preds.numel() else np.array([], dtype=np.int64),
-                lat_true=lat_true,
-                lon_true=lon_true,
-                idx_to_centroid=idx_to_centroid,
-            )
+            if geo_ok:
+                kpi = compute_geo_kpi(
+                    y_true=targets.numpy() if targets.numel() else np.array([], dtype=np.int64),
+                    y_pred=preds.numpy() if preds.numel() else np.array([], dtype=np.int64),
+                    lat_true=lat_true,
+                    lon_true=lon_true,
+                    idx_to_centroid=idx_to_centroid,
+                )
+            else:
+                from .metrics_geo import GeoKPI
+
+                kpi = GeoKPI(
+                    mean_km=0.0,
+                    median_km=0.0,
+                    p90_km=0.0,
+                    p95_km=0.0,
+                    far_error_rate_200=0.0,
+                    far_error_rate_500=0.0,
+                )
 
             hard_added = 0
-            if len(all_img_ids) == int(targets.numel()) and int(targets.numel()) > 0:
+            if geo_ok and len(all_img_ids) == int(targets.numel()) and int(targets.numel()) > 0:
                 val_errors_path = run_dir / "val_errors.parquet"
                 dist_km_arr = _dump_val_errors_parquet(
                     val_errors_path,
@@ -631,6 +776,8 @@ def run_training(
                     hard_added = len(new_hard)
                     hard_pool_ids = update_pool(hard_pool_ids, new_hard, hard_cfg)
                     save_pool(hard_pool_path, hard_pool_ids)
+            else:
+                dist_km_arr = np.array([], dtype=np.float64)
 
             if cfg.early_stop_metric == "val_acc":
                 es_value = float(val_acc)
@@ -688,7 +835,7 @@ def run_training(
                 _dump_val_topk_parquet(out_path, all_img_ids, targets, preds, logits_all, k=dump_k)
                 tqdm.write(f"💾 Saved val topk dump: {out_path.resolve()} (k={dump_k})")
 
-            tag = "geo" if geo_loss is not None else "ce"
+            tag = "geo" if geo_ok and geo_loss is not None else ("ce" if geo_ok else "no-geo")
             hn_tag = f" hardneg(pool={len(hard_pool_ids)},+{hard_added})" if hard_cfg.enabled else ""
             tqdm.write(
                 f"Epoch {epoch:02d} | size={image_size:3d} bs={batch_size:3d} | "

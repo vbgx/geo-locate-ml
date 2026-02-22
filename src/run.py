@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -68,7 +69,7 @@ def _load_labels_json_compat(path: Path) -> Tuple[LabelSpace, Optional[Dict[int,
     A) LabelSpace.to_json():
        { "h3_ids": [...], "h3_to_idx": {...}, "idx_to_h3": {...}, "idx_to_centroid": {...}, ... }
 
-    B) merge_splits_and_build_training_parquet (simple):
+    B) simple (merge step):
        {
          "num_classes": int,
          "labels": [...],
@@ -129,8 +130,12 @@ def _load_labels_json_compat(path: Path) -> Tuple[LabelSpace, Optional[Dict[int,
 
 
 # ============================================================================
-# Proxies (validation)
+# Proxies
 # ============================================================================
+
+
+def _proxy_enabled(cfg: TrainConfig) -> bool:
+    return bool(getattr(cfg, "proxy_loss_enabled", False)) and float(getattr(cfg, "proxy_loss_weight", 0.0)) > 0.0
 
 
 def _validate_proxies_columns(cfg: TrainConfig, df: pd.DataFrame, parquet_path: Path) -> int:
@@ -140,10 +145,7 @@ def _validate_proxies_columns(cfg: TrainConfig, df: pd.DataFrame, parquet_path: 
       - num_proxies (len(cfg.proxy_cols)) if enabled
       - 0 otherwise
     """
-    proxy_enabled = bool(getattr(cfg, "proxy_loss_enabled", False)) and float(
-        getattr(cfg, "proxy_loss_weight", 0.0)
-    ) > 0.0
-    if not proxy_enabled:
+    if not _proxy_enabled(cfg):
         return 0
 
     proxy_cols = list(getattr(cfg, "proxy_cols", []) or [])
@@ -156,10 +158,88 @@ def _validate_proxies_columns(cfg: TrainConfig, df: pd.DataFrame, parquet_path: 
             "proxy_loss_enabled=True but parquet is missing proxy columns:\n"
             f"  parquet: {parquet_path}\n"
             f"  missing: {missing}\n"
-            "Build proxies first and point cfg.parquet_index to the parquet that contains them."
+            "Fix: point cfg.parquet_index to a parquet that contains proxy columns "
+            "(e.g. images_kept_with_proxies.parquet) or update cfg.proxy_cols to match the parquet."
         )
 
     return int(len(proxy_cols))
+
+
+# ============================================================================
+# Parquet selection (the source of truth)
+# ============================================================================
+
+
+def _as_path_from_cfg(cfg_path: str) -> Path:
+    # cfg.parquet_index is usually "data/index/xxx.parquet"
+    # p(*split) keeps compatibility with your existing paths helper
+    return p(*cfg_path.split("/"))
+
+
+def _candidate_with_proxies_paths(base: Path) -> List[Path]:
+    """
+    Build a list of candidate parquets that likely contain proxies,
+    given a base parquet path.
+    """
+    cands: List[Path] = []
+
+    # 1) If already *with_proxies* → keep
+    if "with_proxies" in base.name:
+        cands.append(base)
+
+    # 2) Replace suffix variants
+    stem = base.name
+    parent = base.parent
+
+    # images_kept.parquet -> images_kept_with_proxies.parquet
+    if stem.endswith(".parquet"):
+        cands.append(parent / stem.replace(".parquet", "_with_proxies.parquet"))
+
+    # common explicit name
+    cands.append(parent / "images_kept_with_proxies.parquet")
+    cands.append(parent / "images_with_proxies.parquet")
+
+    # 3) If base is images_kept_with_proxies, also allow images_kept
+    # (not used for enabling proxies, but for fallback logic)
+    return list(dict.fromkeys(cands))  # dedupe preserving order
+
+
+def _select_training_parquet(cfg: TrainConfig) -> Tuple[Path, Dict[str, Any]]:
+    """
+    Deterministic parquet selection:
+    - start from cfg.parquet_index
+    - if proxies enabled: prefer an existing *with_proxies* parquet
+    - else: use cfg.parquet_index as-is
+    """
+    base = _as_path_from_cfg(cfg.parquet_index)
+    debug: Dict[str, Any] = {"cfg_parquet_index": str(base)}
+
+    if not base.exists():
+        raise FileNotFoundError(
+            f"Missing cfg.parquet_index:\n  {base}\n"
+            "Fix: update cfg.parquet_index or rebuild the dataset parquet."
+        )
+
+    if _proxy_enabled(cfg):
+        cands = _candidate_with_proxies_paths(base)
+        debug["proxy_enabled"] = True
+        debug["proxy_candidates"] = [str(x) for x in cands]
+        for cand in cands:
+            if cand.exists():
+                debug["selected_reason"] = "proxy_enabled -> found with_proxies parquet"
+                debug["selected_parquet"] = str(cand)
+                return cand, debug
+
+        # If proxies are enabled but no proxy parquet exists, we still return base;
+        # the validation step will raise with a clear message.
+        debug["selected_reason"] = "proxy_enabled -> no with_proxies parquet found (will fail validation if missing cols)"
+        debug["selected_parquet"] = str(base)
+        return base, debug
+
+    debug["proxy_enabled"] = False
+    debug["selected_reason"] = "proxy disabled -> using cfg.parquet_index"
+    debug["selected_parquet"] = str(base)
+    return base, debug
 
 
 # ============================================================================
@@ -188,6 +268,16 @@ def _maybe_update_global_best(models_dir: Path, best_run_ckpt: str, best_val_acc
     return False
 
 
+def _cfg_to_dict(cfg: TrainConfig) -> Dict[str, Any]:
+    # TrainConfig might be dataclass-like; fall back gracefully
+    if hasattr(cfg, "to_dict") and callable(getattr(cfg, "to_dict")):
+        return cfg.to_dict()  # type: ignore[no-any-return]
+    try:
+        return asdict(cfg)  # type: ignore[arg-type]
+    except Exception:
+        return {k: getattr(cfg, k) for k in dir(cfg) if not k.startswith("_") and isinstance(getattr(cfg, k), (int, float, str, bool, list, dict, type(None)))}
+
+
 def _write_report(run_dir: Path, cfg: TrainConfig, summary, artifacts: dict) -> Path:
     rp = run_dir / "REPORT.md"
     lines: List[str] = []
@@ -213,7 +303,7 @@ def _write_report(run_dir: Path, cfg: TrainConfig, summary, artifacts: dict) -> 
         lines.append(f"- {k}: `{v}`\n")
 
     lines.append("\n## Config\n```json\n")
-    lines.append(json.dumps(cfg.to_dict(), indent=2))
+    lines.append(json.dumps(_cfg_to_dict(cfg), indent=2))
     lines.append("\n```\n")
 
     rp.write_text("".join(lines), encoding="utf-8")
@@ -237,23 +327,26 @@ def main() -> None:
     run_dir = runs_dir / ts
     ensure_dir(run_dir)
 
-    parquet_full = p(*cfg.parquet_index.split("/"))
-    parquet_kept = parquet_full.parent / "images_kept.parquet"
-    parquet_train = parquet_kept if parquet_kept.exists() else parquet_full
+    parquet_train, parquet_debug = _select_training_parquet(cfg)
 
-    if not parquet_train.exists():
-        raise FileNotFoundError(
-            f"Missing {parquet_train}.\n"
-            f"Expected one of:\n"
-            f" - {parquet_kept}\n"
-            f" - {parquet_full}\n"
-            "Run: make rebuild"
-        )
-
-    labels_path = parquet_full.parent / "labels.json"
+    # labels.json is expected next to the parquet (same parent)
+    labels_path = parquet_train.parent / "labels.json"
     if not labels_path.exists():
-        raise FileNotFoundError(f"Missing {labels_path}. Run: make rebuild (merge-splits step).")
+        # fallback: if cfg.parquet_index is in same folder but you selected a different parquet name
+        base = _as_path_from_cfg(cfg.parquet_index)
+        alt = base.parent / "labels.json"
+        if alt.exists():
+            labels_path = alt
+        else:
+            raise FileNotFoundError(
+                f"Missing labels.json.\n"
+                f"Looked in:\n"
+                f" - {parquet_train.parent / 'labels.json'}\n"
+                f" - {base.parent / 'labels.json'}\n"
+                "Fix: run your rebuild/merge step that writes labels.json next to the training parquet."
+            )
 
+    # Load parquet
     df = pd.read_parquet(parquet_train)
 
     required_cols = {"id", "lat", "lon", "path", "h3_id", "label_idx", "split"}
@@ -280,13 +373,12 @@ def main() -> None:
 
     # Proxies validation (only if enabled)
     num_proxies = _validate_proxies_columns(cfg, df, parquet_train)
-    proxy_loss_enabled = bool(getattr(cfg, "proxy_loss_enabled", False)) and float(
-        getattr(cfg, "proxy_loss_weight", 0.0)
-    ) > 0.0
+    proxy_loss_enabled = _proxy_enabled(cfg)
 
     # Snapshots (make the run self-contained)
-    (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
+    (run_dir / "config.json").write_text(json.dumps(_cfg_to_dict(cfg), indent=2), encoding="utf-8")
     (run_dir / "labels.json").write_text(labels_path.read_text(encoding="utf-8"), encoding="utf-8")
+    (run_dir / "parquet_selection.json").write_text(json.dumps(parquet_debug, indent=2), encoding="utf-8")
     shutil.copy2(parquet_train, run_dir / "images_train.parquet")
 
     # Geo distances — ALWAYS compute for this run_dir with this labels set
@@ -320,6 +412,7 @@ def main() -> None:
             r7_parent[int(k)] = int(v)
         r7_parent_t = r7_parent
 
+    # Run training
     summary = run_training(
         cfg,
         parquet_path=str(parquet_train),
@@ -356,6 +449,7 @@ def main() -> None:
         "hierarchical_enabled": hierarchical_enabled,
         "num_classes_r6": int(num_classes_r6),
         "parent_res": int(parent_res),
+        "parquet_selection": parquet_debug.get("selected_reason", ""),
     }
 
     report = _write_report(run_dir, cfg, summary, artifacts)
@@ -371,7 +465,7 @@ def main() -> None:
         "proxy_loss_weight": float(getattr(cfg, "proxy_loss_weight", 0.0)),
         "num_proxies": int(num_proxies),
         "proxy_cols": list(getattr(cfg, "proxy_cols", []) or []),
-        "dropout": float(cfg.dropout),
+        "dropout": float(getattr(cfg, "dropout", 0.0)),
         "geo_loss_enabled": bool(getattr(cfg, "geo_loss_enabled", False)),
         "geo_tau_km": float(getattr(cfg, "geo_tau_km", 0.0)),
         "geo_mix_ce": float(getattr(cfg, "geo_mix_ce", 0.0)),
@@ -384,6 +478,7 @@ def main() -> None:
         "label_idx_max": mx,
         "num_classes_r6": int(num_classes_r6),
         "parent_res": int(parent_res),
+        "parquet_selection": parquet_debug,
     }
 
     _maybe_update_global_best(models_dir, summary.best_ckpt, summary.best_val_acc, meta)
@@ -392,12 +487,15 @@ def main() -> None:
     print("Report:", report)
     print("Runs latest:", runs_dir / "latest")
     print("Global best:", models_dir / "best.pt")
-    if num_proxies:
+    print("Train parquet:", parquet_train)
+    if proxy_loss_enabled:
         print(
             f"Proxies: enabled (num_proxies={num_proxies}) "
             f"weight={float(getattr(cfg, 'proxy_loss_weight', 0.0))}"
         )
         print(f"Proxy cols: {list(getattr(cfg, 'proxy_cols', []) or [])}")
+    else:
+        print("Proxies: disabled")
 
 
 if __name__ == "__main__":

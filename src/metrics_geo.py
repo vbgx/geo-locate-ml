@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
 
 from .geo import haversine_km
 
@@ -40,12 +39,27 @@ class GeoKPI:
 
 
 def compute_geo_kpi(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    lat_true: np.ndarray,
-    lon_true: np.ndarray,
+    y_true,
+    y_pred,
+    lat_true,
+    lon_true,
     idx_to_centroid: Dict[int, Tuple[float, float]],
 ) -> GeoKPI:
+    # Normalize shapes
+    y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.int64).reshape(-1)
+    lat_true = np.asarray(lat_true, dtype=np.float64).reshape(-1)
+    lon_true = np.asarray(lon_true, dtype=np.float64).reshape(-1)
+
+    n = int(y_true.size)
+    if y_pred.size != n:
+        raise RuntimeError(f"compute_geo_kpi: y_pred size mismatch: {y_pred.size} vs y_true {n}")
+    if lat_true.size != n or lon_true.size != n:
+        raise RuntimeError(
+            f"compute_geo_kpi: lat/lon missing or mismatch: "
+            f"lat={lat_true.size} lon={lon_true.size} vs y_true={n}"
+        )
+
     errs: List[float] = []
     for yt, yp, lat, lon in zip(y_true, y_pred, lat_true, lon_true):
         plat, plon = idx_to_centroid[int(yp)]

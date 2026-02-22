@@ -68,7 +68,7 @@ Predict on a specific image:
 
 Predict random sample from training parquet:
 
-    python -m src.predict
+    python -m src.predict --split val --dist --topk 10
 
 With ensemble over multiple sizes:
 

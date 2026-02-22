@@ -7,7 +7,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -19,9 +19,15 @@ from tqdm.auto import tqdm
 
 from .config import TrainConfig
 from .data import GeoDataset, ensure_dir, p, update_latest_symlink
-from .geo import haversine_km
-from .geo import HardNegConfig, build_sample_weights, load_pool, save_pool, update_pool
-from .geo import hierarchical_predict, mask_r7_logits
+from .geo import (
+    HardNegConfig,
+    build_sample_weights,
+    haversine_km,
+    hierarchical_predict,
+    load_pool,
+    save_pool,
+    update_pool,
+)
 from .metrics_geo import compute_geo_kpi
 from .modeling import GeoSoftTargetLoss, MultiScaleCNN, compute_class_weights_from_parquet
 
@@ -29,6 +35,7 @@ from .modeling import GeoSoftTargetLoss, MultiScaleCNN, compute_class_weights_fr
 # ============================================================================
 # Train summary
 # ============================================================================
+
 
 @dataclass
 class TrainSummary:
@@ -44,8 +51,9 @@ class TrainSummary:
 
 
 # ============================================================================
-# Small helpers
+# Helpers
 # ============================================================================
+
 
 def _accuracy(preds: torch.Tensor, targets: torch.Tensor) -> float:
     if targets.numel() == 0:
@@ -64,9 +72,9 @@ def _topk_accuracy(logits: torch.Tensor, targets: torch.Tensor, k: int) -> float
 
 def _is_improved(current: float, best: float, mode: str, min_delta: float) -> bool:
     if mode == "min":
-        return current < (best - min_delta)
+        return current < (best - float(min_delta))
     if mode == "max":
-        return current > (best + min_delta)
+        return current > (best + float(min_delta))
     raise ValueError("mode must be 'min' or 'max'")
 
 
@@ -78,19 +86,17 @@ def _dump_val_topk_parquet(
     logits_all: torch.Tensor,
     k: int,
 ) -> None:
-    import pandas as _pd
-
     if logits_all.numel() == 0:
         return
 
-    N, C = logits_all.shape
-    k = min(int(k), int(C))
+    n, c = logits_all.shape
+    k = min(int(k), int(c))
     topk_vals, topk_idxs = torch.topk(logits_all, k=k, dim=1)
 
-    if len(image_ids) != int(N):
-        image_ids = [f"val_{i:08d}" for i in range(int(N))]
+    if len(image_ids) != int(n):
+        image_ids = [f"val_{i:08d}" for i in range(int(n))]
 
-    df = _pd.DataFrame(
+    df = pd.DataFrame(
         {
             "image_id": image_ids,
             "true_idx": targets.cpu().numpy().astype(int),
@@ -114,17 +120,20 @@ def _dump_val_errors_parquet(
     lon_true: np.ndarray,
     idx_to_centroid: Dict[int, Tuple[float, float]],
 ) -> np.ndarray:
-    import pandas as _pd
+    n = len(image_ids)
+    dist = np.zeros((n,), dtype=np.float64)
 
-    N = len(image_ids)
-    dist = np.zeros((N,), dtype=np.float64)
-
-    for i in range(N):
+    for i in range(n):
         yp = int(y_pred[i])
         plat, plon = idx_to_centroid[int(yp)]
-        dist[i] = haversine_km(float(lat_true[i]), float(lon_true[i]), float(plat), float(plon))
+        dist[i] = haversine_km(
+            float(lat_true[i]),
+            float(lon_true[i]),
+            float(plat),
+            float(plon),
+        )
 
-    df = _pd.DataFrame(
+    df = pd.DataFrame(
         {
             "image_id": image_ids,
             "true_idx": y_true.cpu().numpy().astype(int),
@@ -139,9 +148,40 @@ def _dump_val_errors_parquet(
     return dist
 
 
+def _stats(t: torch.Tensor) -> str:
+    t0 = t.detach()
+    return f"shape={tuple(t0.shape)} min={float(t0.min().cpu()):.4f} max={float(t0.max().cpu()):.4f}"
+
+
+def _debug_first_batch(
+    *,
+    epoch: int,
+    n_batches: int,
+    hierarchical_enabled: bool,
+    loss: torch.Tensor,
+    logits_r6: Optional[torch.Tensor] = None,
+    logits_r7: Optional[torch.Tensor] = None,
+) -> None:
+    if not (epoch == 1 and n_batches == 0):
+        return
+
+    tqdm.write("DEBUG first batch:")
+    tqdm.write(f"  hierarchical_enabled: {hierarchical_enabled}")
+    tqdm.write(f"  loss: {float(loss.detach().cpu()):.6f}")
+    if hierarchical_enabled:
+        if logits_r6 is not None:
+            tqdm.write(f"  logits_r6: {_stats(logits_r6)}")
+        if logits_r7 is not None:
+            tqdm.write(f"  logits_r7(masked): {_stats(logits_r7)}")
+    else:
+        if logits_r7 is not None:
+            tqdm.write(f"  logits: {_stats(logits_r7)}")
+
+
 # ============================================================================
-# Training core (ex train.py)
+# Training core
 # ============================================================================
+
 
 def run_training(
     cfg: TrainConfig,
@@ -151,18 +191,13 @@ def run_training(
     idx_to_centroid: Dict[int, Tuple[float, float]],
     distance_km: Optional[torch.Tensor] = None,
     *,
+    num_proxies: int = 0,
     num_classes_r6: int = 0,
     r7_parent: Optional[torch.Tensor] = None,
 ) -> TrainSummary:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
-
-    dump_k = int(getattr(cfg, "dump_topk", 10))
-    dump_k = max(dump_k, 10)
-    dump_k = max(dump_k, int(getattr(cfg, "topk", 5)))
-
-    proxy_loss_weight = float(getattr(cfg, "proxy_loss_weight", 0.35))  # metrics compat; proxies disabled here
 
     hierarchical_enabled = bool(getattr(cfg, "hierarchical_enabled", False))
     if hierarchical_enabled:
@@ -171,6 +206,25 @@ def run_training(
         if r7_parent is None:
             raise RuntimeError("hierarchical_enabled=True but r7_parent mapping is missing")
 
+    num_proxies = int(num_proxies or 0)
+    proxy_loss_enabled = bool(getattr(cfg, "proxy_loss_enabled", False)) and float(
+        getattr(cfg, "proxy_loss_weight", 0.0)
+    ) > 0.0
+    proxy_cols: List[str] = list(getattr(cfg, "proxy_cols", []) or [])
+
+    if proxy_loss_enabled and num_proxies <= 0:
+        raise RuntimeError("proxy_loss_enabled=True but num_proxies==0 (run.py should pass len(cfg.proxy_cols)).")
+    if proxy_loss_enabled and len(proxy_cols) != num_proxies:
+        raise RuntimeError(f"proxy_cols length mismatch: len(proxy_cols)={len(proxy_cols)} num_proxies={num_proxies}")
+
+    # dump topk
+    dump_k = int(getattr(cfg, "dump_topk", 10))
+    dump_k = max(dump_k, 10)
+    dump_k = max(dump_k, int(getattr(cfg, "topk", 5)))
+
+    proxy_loss_weight = float(getattr(cfg, "proxy_loss_weight", 0.35)) if proxy_loss_enabled else 0.0
+
+    # hard neg
     hard_cfg = HardNegConfig(
         enabled=bool(getattr(cfg, "hardneg_enabled", False)),
         threshold_km=float(getattr(cfg, "hardneg_threshold_km", 500.0)),
@@ -181,21 +235,26 @@ def run_training(
     hard_pool_path = run_dir / "hardneg_pool.json"
     hard_pool_ids = load_pool(hard_pool_path)
 
-    num_proxies = 0
+    # model
     model = MultiScaleCNN(
-        num_classes=num_classes,
+        num_classes=int(num_classes),
         dropout=float(cfg.dropout),
-        num_proxies=num_proxies,
+        num_proxies=int(num_proxies),
         num_classes_r6=int(num_classes_r6),
-        hierarchical_enabled=hierarchical_enabled,
+        hierarchical_enabled=bool(hierarchical_enabled),
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=float(cfg.lr),
+        weight_decay=float(cfg.weight_decay),
+    )
 
+    # Losses
     class_w = compute_class_weights_from_parquet(
         parquet_path,
         split="train",
-        num_classes=num_classes,
+        num_classes=int(num_classes),
         label_column="label_idx",
     ).to(device)
     ce = nn.CrossEntropyLoss(weight=class_w)
@@ -214,11 +273,19 @@ def run_training(
     if bool(getattr(cfg, "geo_loss_enabled", False)):
         if distance_km is None:
             raise RuntimeError("geo_loss_enabled=True but distance_km is None")
-        geo_loss = GeoSoftTargetLoss(distance_km.to(device), tau_km=float(getattr(cfg, "geo_tau_km", 1.8)))
+        geo_loss = GeoSoftTargetLoss(
+            distance_km.to(device),
+            tau_km=float(getattr(cfg, "geo_tau_km", 1.8)),
+        )
 
+    # proxy loss (regression on z-scored proxies; assumes dataset returns proxy vector when enabled)
+    proxy_loss_fn: Optional[nn.Module] = None
+    if proxy_loss_enabled:
+        proxy_loss_fn = nn.SmoothL1Loss(reduction="mean")
+
+    # checkpoints
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-
     best_ckpt = ckpt_dir / "best.pt"
     last_ckpt = ckpt_dir / "last.pt"
     metrics_csv = run_dir / "metrics.csv"
@@ -231,9 +298,10 @@ def run_training(
     best_p90 = float("inf")
     best_median = float("inf")
 
+    best_ckpt_metric = float("inf") if cfg.early_stop_mode == "min" else -float("inf")
+    best_es_value = float("inf") if cfg.early_stop_mode == "min" else -float("inf")
     es_best = float("inf") if cfg.early_stop_mode == "min" else -float("inf")
     es_bad_epochs = 0
-    best_es_value = float("inf") if cfg.early_stop_mode == "min" else -float("inf")
 
     use_cuda = device == "cuda"
     pin = bool(use_cuda)
@@ -277,18 +345,20 @@ def run_training(
                 "train",
                 image_size,
                 hierarchical_enabled=hierarchical_enabled,
+                proxy_columns=proxy_cols if proxy_loss_enabled else None,
             )
             val_ds = GeoDataset(
                 parquet_path,
                 "val",
                 image_size,
                 hierarchical_enabled=hierarchical_enabled,
+                proxy_columns=proxy_cols if proxy_loss_enabled else None,
             )
 
             sampler = None
             shuffle = True
             if hard_cfg.enabled and len(hard_pool_ids) >= hard_cfg.min_count_to_enable:
-                all_ids = train_ds.all_ids() if hasattr(train_ds, "all_ids") else list(getattr(train_ds, "image_ids"))
+                all_ids = train_ds.all_ids()
                 w_by_id = build_sample_weights(all_ids, hard_pool_ids, hard_cfg)
                 weights = torch.tensor([w_by_id.get(sid, 1.0) for sid in all_ids], dtype=torch.double)
                 sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
@@ -318,7 +388,7 @@ def run_training(
             model.train()
             total_loss = 0.0
             total_main = 0.0
-            total_proxy = 0.0  # proxies disabled
+            total_proxy = 0.0
             n_batches = 0
             n_proxy_batches = 0
 
@@ -331,58 +401,119 @@ def run_training(
 
             for batch in train_pbar:
                 if hierarchical_enabled:
-                    x, y6, y, _lat, _lon, _img_id = batch[:6]
+                    # expected: x, y6, y7, lat, lon, img_id, (optional proxy)
+                    x, y6, y7, _lat, _lon, _img_id = batch[:6]
+                    proxy_t = None
+                    if proxy_loss_enabled:
+                        proxy_t = batch[6]
                     x = x.to(device, non_blocking=True)
-                    y = y.to(device, non_blocking=True)
                     y6 = y6.to(device, non_blocking=True)
+                    y7 = y7.to(device, non_blocking=True)
+                    if proxy_t is not None:
+                        proxy_t = proxy_t.to(device, non_blocking=True).float()
                 else:
-                    x, y, _lat, _lon, _img_id = batch[:5]
+                    # expected: x, y7, lat, lon, img_id, (optional proxy)
+                    x, y7, _lat, _lon, _img_id = batch[:5]
+                    proxy_t = None
+                    if proxy_loss_enabled:
+                        proxy_t = batch[5]
                     x = x.to(device, non_blocking=True)
-                    y = y.to(device, non_blocking=True)
+                    y7 = y7.to(device, non_blocking=True)
+                    if proxy_t is not None:
+                        proxy_t = proxy_t.to(device, non_blocking=True).float()
 
                 optimizer.zero_grad(set_to_none=True)
 
                 out = model(x)
 
+                proxy_pred = None
+
+                # --------------------
+                # Main loss (classification)
+                # --------------------
                 if hierarchical_enabled:
-                    if isinstance(out, tuple) and len(out) >= 2:
-                        logits_r6, logits_r7 = out[0], out[1]
-                    else:
+                    if not (isinstance(out, tuple) and len(out) >= 2):
                         raise RuntimeError("hierarchical_enabled=True but model did not return (logits_r6, logits_r7)")
+                    logits_r6, logits_r7 = out[0], out[1]
+                    if proxy_loss_enabled:
+                        if len(out) < 3:
+                            raise RuntimeError("proxy_loss_enabled=True but model did not return proxy head output")
+                        proxy_pred = out[2]
 
                     if ce_r6 is None:
                         raise RuntimeError("hierarchical_enabled=True but ce_r6 is None")
-
-                    loss_r6 = ce_r6(logits_r6, y6)
-
                     if r7_parent_t is None:
                         raise RuntimeError("hierarchical_enabled=True but r7_parent_t is None")
 
-                    logits_r7_masked = mask_r7_logits(logits_r7, y6, r7_parent_t)
+                    loss_r6 = ce_r6(logits_r6, y6)
+
+                    # allowed classes = those whose parent == y6
+                    allowed_mask = r7_parent_t.unsqueeze(0).eq(y6.unsqueeze(1))  # [B,C] bool
+                    logits_r7_masked = logits_r7.masked_fill(~allowed_mask, -1e9)
 
                     if geo_loss is None:
-                        loss_r7 = ce(logits_r7_masked, y)
+                        loss_r7 = ce(logits_r7_masked, y7)
                     else:
-                        loss_geo = geo_loss(logits_r7_masked, y)
-                        loss_ce = ce(logits_r7_masked, y)
+                        loss_geo = geo_loss(logits_r7_masked, y7, allowed_mask=allowed_mask)
+                        loss_ce = ce(logits_r7_masked, y7)
                         loss_r7 = (1.0 - float(cfg.geo_mix_ce)) * loss_geo + float(cfg.geo_mix_ce) * loss_ce
 
                     loss_main = loss_r6 + loss_r7
+
+                    _debug_first_batch(
+                        epoch=epoch,
+                        n_batches=n_batches,
+                        hierarchical_enabled=True,
+                        loss=loss_main,
+                        logits_r6=logits_r6,
+                        logits_r7=logits_r7_masked,
+                    )
                 else:
-                    logits = out[0] if isinstance(out, tuple) else out
-                    if geo_loss is None:
-                        loss_main = ce(logits, y)
+                    if isinstance(out, tuple):
+                        logits = out[0]
+                        if proxy_loss_enabled:
+                            if len(out) < 2:
+                                raise RuntimeError("proxy_loss_enabled=True but model did not return proxy head output")
+                            proxy_pred = out[1]
                     else:
-                        loss_geo = geo_loss(logits, y)
-                        loss_ce = ce(logits, y)
+                        logits = out
+
+                    if geo_loss is None:
+                        loss_main = ce(logits, y7)
+                    else:
+                        loss_geo = geo_loss(logits, y7)
+                        loss_ce = ce(logits, y7)
                         loss_main = (1.0 - float(cfg.geo_mix_ce)) * loss_geo + float(cfg.geo_mix_ce) * loss_ce
 
-                loss = loss_main
+                    _debug_first_batch(
+                        epoch=epoch,
+                        n_batches=n_batches,
+                        hierarchical_enabled=False,
+                        loss=loss_main,
+                        logits_r7=logits,
+                    )
+
+                # --------------------
+                # Proxy loss (optional)
+                # --------------------
+                loss_proxy = torch.tensor(0.0, device=device)
+                if proxy_loss_enabled:
+                    if proxy_loss_fn is None:
+                        raise RuntimeError("proxy_loss_enabled=True but proxy_loss_fn is None")
+                    if proxy_pred is None or proxy_t is None:
+                        raise RuntimeError("proxy_loss_enabled=True but missing proxy_pred/proxy_t")
+                    loss_proxy = proxy_loss_fn(proxy_pred, proxy_t)
+
+                loss = loss_main + float(proxy_loss_weight) * loss_proxy
+
                 loss.backward()
                 optimizer.step()
 
                 total_loss += float(loss.item())
                 total_main += float(loss_main.item())
+                if proxy_loss_enabled:
+                    total_proxy += float(loss_proxy.detach().item())
+                    n_proxy_batches += 1
                 n_batches += 1
 
                 train_pbar.set_postfix(
@@ -400,11 +531,11 @@ def run_training(
             # Val
             # --------------------
             model.eval()
-            all_logits = []
-            all_preds = []
-            all_targets = []
-            all_lat = []
-            all_lon = []
+            all_logits: list[torch.Tensor] = []
+            all_preds: list[torch.Tensor] = []
+            all_targets: list[torch.Tensor] = []
+            all_lat: list[torch.Tensor] = []
+            all_lon: list[torch.Tensor] = []
             all_img_ids: list[str] = []
 
             val_pbar = tqdm(
@@ -417,14 +548,16 @@ def run_training(
             with torch.no_grad():
                 for batch in val_pbar:
                     if hierarchical_enabled:
-                        x, y6, y, lat, lon, img_id = batch[:6]
+                        x, y6, y7, lat, lon, img_id = batch[:6]
                         x = x.to(device, non_blocking=True)
-                        y = y.to(device, non_blocking=True)
                         y6 = y6.to(device, non_blocking=True)
+                        y7 = y7.to(device, non_blocking=True)
 
                         out = model(x)
                         if not (isinstance(out, tuple) and len(out) >= 2):
-                            raise RuntimeError("hierarchical_enabled=True but model did not return (logits_r6, logits_r7)")
+                            raise RuntimeError(
+                                "hierarchical_enabled=True but model did not return (logits_r6, logits_r7)"
+                            )
                         logits_r6, logits_r7 = out[0], out[1]
 
                         if r7_parent_t is None:
@@ -437,9 +570,9 @@ def run_training(
                         )
                         logits = logits_masked
                     else:
-                        x, y, lat, lon, img_id = batch[:5]
+                        x, y7, lat, lon, img_id = batch[:5]
                         x = x.to(device, non_blocking=True)
-                        y = y.to(device, non_blocking=True)
+                        y7 = y7.to(device, non_blocking=True)
 
                         out = model(x)
                         logits = out[0] if isinstance(out, tuple) else out
@@ -447,15 +580,17 @@ def run_training(
 
                     all_logits.append(logits.detach().cpu())
                     all_preds.append(preds.detach().cpu())
-                    all_targets.append(y.detach().cpu())
+                    all_targets.append(y7.detach().cpu())
                     all_lat.append(lat.detach().cpu())
                     all_lon.append(lon.detach().cpu())
                     all_img_ids.extend([str(s) for s in img_id])
 
-                    batch_acc = float((preds == y).float().mean().item())
+                    batch_acc = float((preds == y7.detach().cpu()).float().mean().item())
                     val_pbar.set_postfix(acc=f"{batch_acc:.3f}")
 
-            logits_all = torch.cat(all_logits, dim=0) if all_logits else torch.empty((0, num_classes), dtype=torch.float32)
+            logits_all = (
+                torch.cat(all_logits, dim=0) if all_logits else torch.empty((0, num_classes), dtype=torch.float32)
+            )
             preds = torch.cat(all_preds, dim=0) if all_preds else torch.empty((0,), dtype=torch.long)
             targets = torch.cat(all_targets, dim=0) if all_targets else torch.empty((0,), dtype=torch.long)
 
@@ -491,7 +626,7 @@ def run_training(
                     new_hard = [
                         all_img_ids[i]
                         for i in range(len(all_img_ids))
-                        if float(dist_km_arr[i]) > hard_cfg.threshold_km
+                        if float(dist_km_arr[i]) > float(hard_cfg.threshold_km)
                     ]
                     hard_added = len(new_hard)
                     hard_pool_ids = update_pool(hard_pool_ids, new_hard, hard_cfg)
@@ -514,7 +649,7 @@ def run_training(
                     f"{train_loss:.6f}",
                     f"{train_loss_main:.6f}",
                     f"{train_loss_proxy:.6f}",
-                    f"{proxy_loss_weight if num_proxies else 0.0:.6f}",
+                    f"{proxy_loss_weight if proxy_loss_enabled else 0.0:.6f}",
                     f"{val_acc:.6f}",
                     f"{val_top5:.6f}",
                     f"{val_top10:.6f}",
@@ -532,19 +667,23 @@ def run_training(
             f.flush()
 
             torch.save(model.state_dict(), last_ckpt)
-            if val_acc > best_acc:
-                best_acc = val_acc
-                best_epoch = epoch
-                best_size = image_size
+
+            if float(val_acc) > float(best_acc):
+                best_acc = float(val_acc)
+                best_epoch = int(epoch)
+                best_size = int(image_size)
+
+            if _is_improved(float(es_value), float(best_ckpt_metric), cfg.early_stop_mode, cfg.early_stop_min_delta):
+                best_ckpt_metric = float(es_value)
                 torch.save(model.state_dict(), best_ckpt)
 
-            if kpi.p90_km < best_p90:
+            if float(kpi.p90_km) < best_p90:
                 best_p90 = float(kpi.p90_km)
-            if kpi.median_km < best_median:
+            if float(kpi.median_km) < best_median:
                 best_median = float(kpi.median_km)
 
-            if _is_improved(es_value, best_es_value, cfg.early_stop_mode, cfg.early_stop_min_delta):
-                best_es_value = es_value
+            if _is_improved(float(es_value), float(best_es_value), cfg.early_stop_mode, cfg.early_stop_min_delta):
+                best_es_value = float(es_value)
                 out_path = run_dir / "val_topk.parquet"
                 _dump_val_topk_parquet(out_path, all_img_ids, targets, preds, logits_all, k=dump_k)
                 tqdm.write(f"💾 Saved val topk dump: {out_path.resolve()} (k={dump_k})")
@@ -553,7 +692,7 @@ def run_training(
             hn_tag = f" hardneg(pool={len(hard_pool_ids)},+{hard_added})" if hard_cfg.enabled else ""
             tqdm.write(
                 f"Epoch {epoch:02d} | size={image_size:3d} bs={batch_size:3d} | "
-                f"loss={train_loss:.4f} (main={train_loss_main:.4f}) | "
+                f"loss={train_loss:.4f} (main={train_loss_main:.4f} proxy={train_loss_proxy:.4f}) | "
                 f"val_acc={val_acc:.4f} | top5={val_top5:.4f} top10={val_top10:.4f} | "
                 f"median={kpi.median_km:.2f}km p90={kpi.p90_km:.2f}km | "
                 f"far200={kpi.far_error_rate_200:.3f} far500={kpi.far_error_rate_500:.3f} | "
@@ -568,17 +707,17 @@ def run_training(
                 p90_km=f"{kpi.p90_km:.1f}",
             )
 
-            if cfg.early_stopping_enabled:
-                improved = _is_improved(es_value, es_best, cfg.early_stop_mode, cfg.early_stop_min_delta)
+            if bool(getattr(cfg, "early_stopping_enabled", False)):
+                improved = _is_improved(float(es_value), float(es_best), cfg.early_stop_mode, cfg.early_stop_min_delta)
                 if improved:
-                    es_best = es_value
+                    es_best = float(es_value)
                     es_bad_epochs = 0
                 else:
                     es_bad_epochs += 1
                     if es_bad_epochs >= int(cfg.early_stop_patience):
                         tqdm.write(
                             f"⏹ Early stopping: no improvement on {cfg.early_stop_metric} "
-                            f"for {int(cfg.early_stop_patience)} epochs. Best={es_best:.4f}"
+                            f"for {int(cfg.early_stop_patience)} epochs. Best={es_best:.6f}"
                         )
                         break
 
@@ -596,53 +735,41 @@ def run_training(
 
 
 # ============================================================================
-# Run orchestration (ex run.py) - kept here to reduce file count
+# Orchestration (run once) — kept for backward-compat / CLI usage
 # ============================================================================
 
+
 def _compute_distance_matrix_km(idx_to_centroid: Dict[int, Tuple[float, float]]) -> torch.Tensor:
-    C = len(idx_to_centroid)
-    D = torch.zeros((C, C), dtype=torch.float32)
-    for i in range(C):
+    c = len(idx_to_centroid)
+    d = torch.zeros((c, c), dtype=torch.float32)
+    for i in range(c):
         lat1, lon1 = idx_to_centroid[i]
-        for j in range(C):
+        for j in range(c):
             lat2, lon2 = idx_to_centroid[j]
-            D[i, j] = float(haversine_km(lat1, lon1, lat2, lon2))
-    return D
+            d[i, j] = float(haversine_km(lat1, lon1, lat2, lon2))
+    return d
 
 
 def _ensure_geo_distance_matrix(run_dir: Path, idx_to_centroid: Dict[int, Tuple[float, float]]) -> torch.Tensor:
-    C = len(idx_to_centroid)
-    D = _compute_distance_matrix_km(idx_to_centroid)
-    if D.shape != (C, C):
-        raise RuntimeError(f"Distance matrix shape mismatch: D={tuple(D.shape)} expected=({C},{C}).")
+    c = len(idx_to_centroid)
+    d = _compute_distance_matrix_km(idx_to_centroid)
+    if d.shape != (c, c):
+        raise RuntimeError(f"Distance matrix shape mismatch: D={tuple(d.shape)} expected=({c},{c}).")
     dist_path = run_dir / "dist_km.pt"
-    torch.save(D, dist_path)
-    return D
+    torch.save(d, dist_path)
+    return d
 
 
 def _load_labels_json(path: Path) -> Tuple[list[str], Dict[int, Tuple[float, float]], Optional[Dict[int, int]], int]:
-    """
-    Load labels.json produced by merge step.
-
-    Supported formats:
-      - legacy:
-          {"labels":[...], "label_to_idx":{...}}
-      - extended (from src.data.merge_splits_and_build_training_parquet):
-          {"labels":[...], "label_to_idx":{...}, "r7_to_r6":{...}, "parent_res": 6}
-
-    Returns:
-      (labels_list, idx_to_centroid, r7_to_r6, parent_res)
-    """
     obj = json.loads(path.read_text(encoding="utf-8"))
 
     labels_list = obj.get("labels") or obj.get("h3_ids")
     if not isinstance(labels_list, list) or not labels_list:
-        raise RuntimeError(f"Invalid labels file: missing 'labels' list: {path}")
+        raise RuntimeError(f"Invalid labels file: missing labels list: {path}")
 
     labels_list = [str(h) for h in labels_list]
 
-    # Centroids from H3 cell center
-    import h3 as _h3  # local import
+    import h3 as _h3
 
     idx_to_centroid: Dict[int, Tuple[float, float]] = {}
     for i, h3_id in enumerate(labels_list):
@@ -655,65 +782,14 @@ def _load_labels_json(path: Path) -> Tuple[list[str], Dict[int, Tuple[float, flo
         r7_to_r6 = {int(k): int(v) for k, v in r7_to_r6_raw.items()}
 
     parent_res = int(obj.get("parent_res", 6))
-
     return labels_list, idx_to_centroid, r7_to_r6, parent_res
-
-
-def _maybe_update_global_best(models_dir: Path, best_run_ckpt: str, best_val_acc: float, meta: dict) -> bool:
-    best_pt = models_dir / "best.pt"
-    best_json = models_dir / "best.json"
-
-    prev = -1.0
-    if best_json.exists():
-        try:
-            prev = float(json.loads(best_json.read_text(encoding="utf-8")).get("best_val_acc", -1.0))
-        except Exception:
-            prev = -1.0
-
-    if best_val_acc > prev:
-        shutil.copy2(best_run_ckpt, best_pt)
-        best_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        print(f"✅ New GLOBAL BEST: {best_val_acc:.4f} (updated models/best.pt)")
-        return True
-
-    print(f"🧹 Not better than global best ({prev:.4f}). Global best unchanged.")
-    return False
-
-
-def _write_report(run_dir: Path, cfg: TrainConfig, summary: TrainSummary, artifacts: dict) -> Path:
-    rp = run_dir / "REPORT.md"
-    lines: list[str] = []
-    lines.append("# geo-locate-ml — Run report\n\n")
-    lines.append(f"- Timestamp: `{artifacts['timestamp']}`\n")
-    lines.append(f"- Device: `{summary.device}`\n")
-    lines.append(f"- Best val acc: `{summary.best_val_acc:.4f}`\n")
-    lines.append(f"- Best epoch: `{summary.best_epoch}`\n")
-    lines.append(f"- Best image_size: `{summary.best_image_size}`\n")
-    lines.append(f"- Best geo median (val): `{summary.best_median_km:.2f} km`\n")
-    lines.append(f"- Best geo p90 (val): `{summary.best_p90_km:.2f} km`\n")
-    lines.append(f"- Train parquet: `{artifacts['train_parquet']}`\n")
-
-    lines.append("\n## Artifacts\n")
-    for k, v in artifacts.items():
-        if k == "timestamp":
-            continue
-        lines.append(f"- {k}: `{v}`\n")
-
-    lines.append("\n## Config\n```json\n")
-    lines.append(json.dumps(cfg.to_dict(), indent=2))
-    lines.append("\n```\n")
-
-    rp.write_text("".join(lines), encoding="utf-8")
-    return rp
 
 
 def run_once(cfg: Optional[TrainConfig] = None) -> Path:
     cfg = cfg or TrainConfig()
 
     runs_dir = p("runs")
-    models_dir = p("models")
     ensure_dir(runs_dir)
-    ensure_dir(models_dir)
 
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = runs_dir / ts
@@ -721,40 +797,49 @@ def run_once(cfg: Optional[TrainConfig] = None) -> Path:
 
     parquet_full = p(*str(cfg.parquet_index).split("/"))
     parquet_kept = parquet_full.parent / "images_kept.parquet"
-
     parquet_train = parquet_kept if parquet_kept.exists() else parquet_full
 
     if not parquet_train.exists():
-        raise FileNotFoundError(
-            f"Missing {parquet_train}.\n"
-            f"Expected one of:\n"
-            f" - {parquet_kept}\n"
-            f" - {parquet_full}\n"
-            f"Run: make rebuild"
-        )
+        raise FileNotFoundError(f"Missing {parquet_train}. Run: make rebuild")
 
     labels_path = parquet_full.parent / "labels.json"
     if not labels_path.exists():
-        raise FileNotFoundError(f"Missing {labels_path}. Run: make rebuild (merge-splits step).")
+        raise FileNotFoundError(f"Missing {labels_path}. Run: make rebuild")
 
     df = pd.read_parquet(parquet_train)
-
     required_cols = {"id", "lat", "lon", "path", "h3_id", "label_idx", "split"}
     missing = sorted(list(required_cols - set(df.columns)))
+
+    proxy_loss_weight = float(getattr(cfg, "proxy_loss_weight", 0.0))
+    proxy_loss_enabled = bool(getattr(cfg, "proxy_loss_enabled", False)) and (proxy_loss_weight > 0.0)
+    proxy_cols = list(getattr(cfg, "proxy_cols", [])) or [
+        "proxy_elev_log1p_z",
+        "proxy_pop_log1p_z",
+        "proxy_water_frac",
+        "proxy_built_frac",
+        "proxy_coastal_score",
+    ]
+    if proxy_loss_enabled:
+        missing_proxy = sorted([c for c in proxy_cols if c not in df.columns])
+        if missing_proxy:
+            raise RuntimeError(f"proxy_loss_enabled=True but {parquet_train} missing columns: {missing_proxy}")
+
     if missing:
         raise RuntimeError(f"{parquet_train} missing columns: {missing}")
 
+    hierarchical_enabled = bool(getattr(cfg, "hierarchical_enabled", False))
+    if hierarchical_enabled and "label_r6_idx" not in df.columns:
+        raise RuntimeError("hierarchical_enabled=True but parquet is missing label_r6_idx. Rebuild parquet.")
+
     labels_list, idx_to_centroid, r7_to_r6, parent_res = _load_labels_json(labels_path)
 
-    C = int(len(labels_list))
-    if C <= 1:
-        raise RuntimeError(f"Num classes looks wrong (C={C}). Check labels.json + parquet.")
-
+    c = int(len(labels_list))
+    if c <= 1:
+        raise RuntimeError(f"Num classes looks wrong (C={c}). Check labels.json + parquet.")
     mx = int(df["label_idx"].max()) if len(df) else -1
-    if mx >= C:
-        raise RuntimeError(f"label_idx max={mx} but num_classes={C}. labels.json and parquet are inconsistent.")
+    if mx >= c:
+        raise RuntimeError(f"label_idx max={mx} but num_classes={c}. labels.json and parquet are inconsistent.")
 
-    # snapshots
     (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
     (run_dir / "labels.json").write_text(labels_path.read_text(encoding="utf-8"), encoding="utf-8")
     shutil.copy2(parquet_train, run_dir / "images_train.parquet")
@@ -763,23 +848,17 @@ def run_once(cfg: Optional[TrainConfig] = None) -> Path:
     if bool(getattr(cfg, "geo_loss_enabled", False)):
         dist_km = _ensure_geo_distance_matrix(run_dir, idx_to_centroid)
 
-    # hierarchy wiring (optional)
-    hierarchical_enabled = bool(getattr(cfg, "hierarchical_enabled", False))
     num_classes_r6 = 0
     r7_parent_t: Optional[torch.Tensor] = None
     if hierarchical_enabled:
-        if r7_to_r6 is None or len(r7_to_r6) != C:
-            raise RuntimeError(
-                "hierarchical_enabled=True but labels.json missing r7_to_r6 (or wrong size). "
-                "Rebuild labels via merge step that writes r7_to_r6."
-            )
-        # derive num_classes_r6 from mapping
+        if r7_to_r6 is None or len(r7_to_r6) != c:
+            raise RuntimeError("hierarchical_enabled=True but labels.json missing r7_to_r6 (or wrong size).")
+
         num_classes_r6 = int(max(r7_to_r6.values()) + 1) if r7_to_r6 else 0
         if num_classes_r6 <= 1:
             raise RuntimeError("hierarchical_enabled=True but num_classes_r6 looks invalid")
 
-        # r7_parent: [C] -> r6 idx
-        r7_parent = torch.zeros((C,), dtype=torch.long)
+        r7_parent = torch.zeros((c,), dtype=torch.long)
         for k, v in r7_to_r6.items():
             r7_parent[int(k)] = int(v)
         r7_parent_t = r7_parent
@@ -787,7 +866,7 @@ def run_once(cfg: Optional[TrainConfig] = None) -> Path:
     summary = run_training(
         cfg,
         parquet_path=str(parquet_train),
-        num_classes=C,
+        num_classes=c,
         run_dir=run_dir,
         idx_to_centroid=idx_to_centroid,
         distance_km=dist_km if bool(getattr(cfg, "geo_loss_enabled", False)) else None,
@@ -797,47 +876,33 @@ def run_once(cfg: Optional[TrainConfig] = None) -> Path:
 
     update_latest_symlink(runs_dir, run_dir)
 
-    artifacts: Dict[str, Any] = {
+    meta: Dict[str, Any] = {
         "timestamp": ts,
         "run_dir": str(run_dir),
-        "latest": str(runs_dir / "latest"),
         "train_parquet": str(parquet_train),
         "labels_path": str(labels_path),
-        "dist_km_pt": str(run_dir / "dist_km.pt") if (run_dir / "dist_km.pt").exists() else "",
-        "metrics_csv": summary.metrics_csv,
-        "best_ckpt": summary.best_ckpt,
-        "last_ckpt": summary.last_ckpt,
-        "num_classes": C,
-        "label_idx_max": mx,
+        "num_classes": int(c),
+        "label_idx_max": int(mx),
+        "hierarchical_enabled": bool(hierarchical_enabled),
+        "num_classes_r6": int(num_classes_r6),
+        "parent_res": int(parent_res),
+        "proxy_loss_enabled": bool(proxy_loss_enabled),
+        "proxy_loss_weight": float(proxy_loss_weight),
+        "proxy_cols": proxy_cols if proxy_loss_enabled else [],
+        "best_val_acc": float(summary.best_val_acc),
+        "best_epoch": int(summary.best_epoch),
+        "best_image_size": int(summary.best_image_size),
+        "best_geo_median_km": float(summary.best_median_km),
+        "best_geo_p90_km": float(summary.best_p90_km),
     }
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    report = _write_report(run_dir, cfg, summary, artifacts)
-
-    meta = {
-        "best_val_acc": summary.best_val_acc,
-        "timestamp": ts,
-        "run_dir": str(run_dir),
-        "labels_path": str(labels_path),
-        "train_parquet": str(parquet_train),
-        "dropout": float(cfg.dropout),
-        "geo_loss_enabled": bool(getattr(cfg, "geo_loss_enabled", False)),
-        "geo_tau_km": float(getattr(cfg, "geo_tau_km", 0.0)),
-        "geo_mix_ce": float(getattr(cfg, "geo_mix_ce", 0.0)),
-        "best_geo_median_km": summary.best_median_km,
-        "best_geo_p90_km": summary.best_p90_km,
-        "early_stopping_enabled": bool(getattr(cfg, "early_stopping_enabled", False)),
-        "early_stop_metric": str(getattr(cfg, "early_stop_metric", "")),
-        "hierarchical_enabled": bool(getattr(cfg, "hierarchical_enabled", False)),
-        "num_classes": C,
-        "label_idx_max": mx,
-    }
-
-    _maybe_update_global_best(models_dir, summary.best_ckpt, summary.best_val_acc, meta)
-
-    print("\nDone.")
-    print("Report:", report)
-    print("Runs latest:", runs_dir / "latest")
-    print("Global best:", models_dir / "best.pt")
+    tqdm.write("\nDone.")
+    tqdm.write(f"Run dir: {run_dir}")
+    tqdm.write(f"Latest: {runs_dir / 'latest'}")
+    tqdm.write(f"Metrics: {run_dir / 'metrics.csv'}")
+    tqdm.write(f"Best ckpt: {run_dir / 'checkpoints' / 'best.pt'}")
+    tqdm.write(f"Last ckpt: {run_dir / 'checkpoints' / 'last.pt'}")
 
     return run_dir
 
@@ -851,7 +916,6 @@ def main() -> None:
         run_once()
         return
 
-    # default behavior: run once
     run_once()
 
 

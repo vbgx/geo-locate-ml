@@ -1,17 +1,17 @@
 {
-  "best_val_acc": 0.6855840682983398,
-  "timestamp": "2026-02-20_20-34-45",
-  "run_dir": "/Users/victorbergeroux/Desktop/geo-locate-ml/runs/2026-02-20_20-34-45",
-  "labels_path": "/Users/victorbergeroux/Desktop/geo-locate-ml/runs/2026-02-20_20-34-45/labels.json",
-  "parquet_path": "/Users/victorbergeroux/Desktop/geo-locate-ml/data/index/images.parquet",
+  "timestamp": "2026-02-21_11-07-45",
+  "run_dir": "/Users/victorbergeroux/Desktop/geo-locate-ml/runs/2026-02-21_11-07-45",
+  "best_val_acc": 0.6416,
+  "best_epoch": 26,
+  "best_image_size": 128,
+  "best_geo_median_km": 1.07,
+  "best_geo_p90_km": 578.75,
+  "labels_path": "/Users/victorbergeroux/Desktop/geo-locate-ml/runs/2026-02-21_11-07-45/labels.json",
+  "train_parquet": "/Users/victorbergeroux/Desktop/geo-locate-ml/runs/2026-02-21_11-07-45/images_train.parquet",
   "dropout": 0.3,
+  "hierarchical_enabled": false,
   "geo_loss_enabled": true,
   "geo_tau_km": 1.8,
   "geo_mix_ce": 0.45,
-  "best_geo_median_km": 1.0491591113836898,
-  "best_geo_p90_km": 457.378942468561,
-  "early_stopping_enabled": true,
-  "early_stop_metric": "median_km",
-  "num_classes": 370,
-  "label_idx_max": 369
+  "dist_km_pt": "/Users/victorbergeroux/Desktop/geo-locate-ml/runs/2026-02-21_11-07-45/dist_km.pt"
 }

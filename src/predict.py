@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from pathlib import Path
 from typing import Optional
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .data import build_transform
-from .geo_assets import hierarchical_predict
+from .geo import hierarchical_predict
 from .labels import LabelSpace
 from .modeling import MultiScaleCNN
 from .paths import p
@@ -24,10 +25,46 @@ def load_best_metadata() -> dict:
     return json.loads(meta_path.read_text(encoding="utf-8"))
 
 
-def pick_random_from_parquet(parquet_path: str) -> tuple[Path, str, str]:
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0088
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = (math.sin(dphi / 2.0) ** 2) + math.cos(phi1) * math.cos(phi2) * (math.sin(dlmb / 2.0) ** 2)
+    return 2.0 * R * math.asin(math.sqrt(a))
+
+
+def _h3_center_latlng(h3_id: str) -> tuple[float, float]:
+    try:
+        import h3
+    except Exception as e:
+        raise RuntimeError(
+            "Distance requested but the `h3` package is not available. Install it (e.g. `pip install h3`)."
+        ) from e
+
+    if hasattr(h3, "cell_to_latlng"):
+        lat, lng = h3.cell_to_latlng(h3_id)
+    else:
+        lat, lng = h3.h3_to_geo(h3_id)
+    return float(lat), float(lng)
+
+
+def _h3_dist_km(a: str, b: str) -> float:
+    lat1, lon1 = _h3_center_latlng(a)
+    lat2, lon2 = _h3_center_latlng(b)
+    return _haversine_km(lat1, lon1, lat2, lon2)
+
+
+def pick_random_from_parquet(parquet_path: str, split: str = "any") -> tuple[Path, str, str]:
     import pandas as pd
 
     df = pd.read_parquet(parquet_path)
+    if split and split != "any":
+        df = df[df["split"] == split]
+        if len(df) == 0:
+            raise RuntimeError(f"No rows found for split='{split}' in parquet: {parquet_path}")
+
     row = df.sample(n=1, random_state=random.randint(0, 10_000)).iloc[0]
     return Path(row["path"]), str(row.get("h3_id")), str(row.get("split"))
 
@@ -52,12 +89,21 @@ def topk(classes: list[str], probs: torch.Tensor, k: int = 5) -> list[tuple[str,
     return [(classes[int(i)], float(v)) for v, i in zip(vals, idxs)]
 
 
+def _rank_of_true(probs: torch.Tensor, true_idx: int) -> int:
+    # 1-based rank: 1 means best
+    # rank = 1 + number of classes with strictly greater probability
+    true_p = float(probs[true_idx].item())
+    return 1 + int((probs > true_p).sum().item())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("image_path", nargs="?", default=None)
     ap.add_argument("--ensemble", action="store_true")
     ap.add_argument("--sizes", default="64,128,192")
     ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--split", default="any", choices=["any", "train", "val", "test"])
+    ap.add_argument("--dist", action="store_true", help="Print distance (km) to true H3 for each top-k (requires true label).")
     args = ap.parse_args()
 
     meta = load_best_metadata()
@@ -86,8 +132,9 @@ def main() -> None:
     model.eval()
 
     true_h3: Optional[str] = None
+    split: Optional[str] = None
     if args.image_path is None:
-        img_path, true_h3, split = pick_random_from_parquet(str(parquet_path))
+        img_path, true_h3, split = pick_random_from_parquet(str(parquet_path), split=args.split)
         print(f"\nPicked: {img_path}")
         print(f"True h3: {true_h3} (split={split})")
     else:
@@ -104,6 +151,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+    pred_r6_h3: Optional[str] = None
     if hierarchical_enabled:
         r7_parent = torch.tensor(
             [int(labels.r7_to_r6[i]) for i in range(len(labels.h3_ids))],
@@ -136,7 +184,8 @@ def main() -> None:
 
         pred_r6, pred_r7, masked = hierarchical_predict(logits_r6, logits_r7, r7_parent)
         probs = F.softmax(masked, dim=1)[0]
-        print(f"Pred r6: {labels.idx_to_h3_r6[int(pred_r6.item())]}")
+        pred_r6_h3 = labels.idx_to_h3_r6[int(pred_r6.item())]
+        print(f"Pred r6: {pred_r6_h3}")
     else:
         if args.ensemble:
             logits_list = []
@@ -154,12 +203,37 @@ def main() -> None:
         probs = F.softmax(logits, dim=1)[0]
 
     # ------------------------------------------------------------------
-    # Print
+    # True rank diagnostics
+    # ------------------------------------------------------------------
+    if true_h3 and true_h3 in labels.h3_ids:
+        true_idx = labels.h3_ids.index(true_h3)
+        true_rank = _rank_of_true(probs, true_idx)
+        true_p = float(probs[true_idx].item())
+        in_topk = true_rank <= int(args.topk)
+        print(f"\nTrue rank: {true_rank}   true_p={true_p:.6f}   in_top{args.topk}={in_topk}")
+
+        if hierarchical_enabled and pred_r6_h3 is not None:
+            try:
+                true_r6_idx = int(labels.r7_to_r6[true_idx])
+                true_r6_h3 = labels.idx_to_h3_r6[true_r6_idx]
+                print(f"True r6: {true_r6_h3}   r6_match={true_r6_h3 == pred_r6_h3}")
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Print top-k
     # ------------------------------------------------------------------
     print("\nTop-k (model probs):")
     out = topk(labels.h3_ids, probs, k=args.topk)
     for i, (h, pr) in enumerate(out, start=1):
-        print(f"{i:>2}. {h}   p={pr:.4f}")
+        if args.dist and true_h3:
+            try:
+                dkm = _h3_dist_km(h, true_h3)
+                print(f"{i:>2}. {h}   p={pr:.4f}   dist_km={dkm:.2f}")
+            except Exception as e:
+                print(f"{i:>2}. {h}   p={pr:.4f}   dist_km=? ({type(e).__name__})")
+        else:
+            print(f"{i:>2}. {h}   p={pr:.4f}")
 
 
 if __name__ == "__main__":

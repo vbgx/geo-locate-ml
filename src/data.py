@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import torch
@@ -15,10 +16,25 @@ from torchvision import transforms
 
 import h3
 
+# NOTE:
+# This version adds OPTIONAL proxy targets to GeoDataset without breaking existing callers.
+#
+# - Existing behavior is preserved:
+#   - When proxies are disabled, the returned sample tuples are unchanged.
+#   - The legacy arg `use_proxies=` is still accepted (alias).
+#
+# - New behavior:
+#   - When proxies_enabled=True, we APPEND (proxy_targets, proxy_mask) at the end of each sample tuple.
+#   - proxy_targets: float32 [P]
+#   - proxy_mask:    float32 [P] with 0/1 indicating which proxy values are present/finite.
+#
+# This lets training ignore missing proxy values safely while keeping old batch unpacking stable.
+
 
 # ============================================================================
-# Paths (ex paths.py)
+# Paths
 # ============================================================================
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -40,8 +56,9 @@ def update_latest_symlink(runs_dir: Path, run_dir: Path) -> None:
 
 
 # ============================================================================
-# Splits (ex splits.py + tools/dataset/make_splits.py)
+# Splits (sequence-aware, deterministic)
 # ============================================================================
+
 
 def _stable_hash_to_unit_interval(s: str, seed: int) -> float:
     h = hashlib.sha256(f"{seed}:{s}".encode("utf-8")).hexdigest()
@@ -60,7 +77,9 @@ def assign_split_by_sequence(
     Deterministic split assignment based on sequence_id (or id fallback).
     Produces a 'split' column with values: train/val/test.
     """
-    assert abs((p_train + p_val + p_test) - 1.0) < 1e-6, "splits must sum to 1.0"
+    if abs((p_train + p_val + p_test) - 1.0) >= 1e-6:
+        raise ValueError("splits must sum to 1.0")
+
     df = df.copy()
 
     if "sequence_id" not in df.columns:
@@ -90,8 +109,13 @@ def make_splits_parquet(
     test: float = 0.05,
 ) -> Path:
     """
-    Equivalent to tools/dataset/make_splits.py but as a library function.
     Reads images.parquet (must contain line_idx) and writes splits.parquet.
+
+    Output columns:
+      - line_idx
+      - id
+      - sequence_id
+      - split
     """
     in_parquet = Path(in_parquet)
     out_parquet = Path(out_parquet)
@@ -102,9 +126,7 @@ def make_splits_parquet(
     df = pd.read_parquet(in_parquet)
 
     if "line_idx" not in df.columns:
-        raise RuntimeError(
-            "images.parquet missing line_idx. Rebuild index with parity-strict build_index.py."
-        )
+        raise RuntimeError("images.parquet missing line_idx. Rebuild index with build_index.py.")
 
     df = assign_split_by_sequence(df, seed=seed, p_train=train, p_val=val, p_test=test)
 
@@ -112,27 +134,32 @@ def make_splits_parquet(
 
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(out_parquet, index=False)
-
     return out_parquet
 
 
 # ============================================================================
-# Labels / H3 (ex labels.py)
+# Labels / H3
 # ============================================================================
+
 
 @dataclass
 class LabelSpace:
+    # R7
     h3_ids: List[str]
     h3_to_idx: Dict[str, int]
     idx_to_h3: Dict[int, str]
     idx_to_centroid: Dict[int, Tuple[float, float]]  # (lat, lon)
 
+    # Hierarchy
     parent_res: int = 6
 
+    # R6
     h3_ids_r6: List[str] = field(default_factory=list)
     h3_r6_to_idx: Dict[str, int] = field(default_factory=dict)
     idx_to_h3_r6: Dict[int, str] = field(default_factory=dict)
     idx_to_centroid_r6: Dict[int, Tuple[float, float]] = field(default_factory=dict)
+
+    # mappings (indices)
     r7_to_r6: Dict[int, int] = field(default_factory=dict)
     r6_to_r7: Dict[int, List[int]] = field(default_factory=dict)
 
@@ -141,18 +168,14 @@ class LabelSpace:
             "h3_ids": self.h3_ids,
             "h3_to_idx": self.h3_to_idx,
             "idx_to_h3": {str(k): v for k, v in self.idx_to_h3.items()},
-            "idx_to_centroid": {
-                str(k): [lat, lon] for k, (lat, lon) in self.idx_to_centroid.items()
-            },
+            "idx_to_centroid": {str(k): [lat, lon] for k, (lat, lon) in self.idx_to_centroid.items()},
             "parent_res": int(self.parent_res),
             "h3_ids_r6": self.h3_ids_r6,
             "h3_r6_to_idx": self.h3_r6_to_idx,
             "idx_to_h3_r6": {str(k): v for k, v in self.idx_to_h3_r6.items()},
-            "idx_to_centroid_r6": {
-                str(k): [lat, lon] for k, (lat, lon) in self.idx_to_centroid_r6.items()
-            },
-            "r7_to_r6": {str(k): v for k, v in self.r7_to_r6.items()},
-            "r6_to_r7": {str(k): v for k, v in self.r6_to_r7.items()},
+            "idx_to_centroid_r6": {str(k): [lat, lon] for k, (lat, lon) in self.idx_to_centroid_r6.items()},
+            "r7_to_r6": {str(k): int(v) for k, v in self.r7_to_r6.items()},
+            "r6_to_r7": {str(k): [int(x) for x in v] for k, v in self.r6_to_r7.items()},
         }
         return json.dumps(payload, indent=2)
 
@@ -160,21 +183,18 @@ class LabelSpace:
     def from_json(text: str) -> "LabelSpace":
         obj = json.loads(text)
 
-        h3_ids = obj["h3_ids"]
-        h3_to_idx = {k: int(v) for k, v in obj["h3_to_idx"].items()}
-        idx_to_h3 = {int(k): v for k, v in obj["idx_to_h3"].items()}
-        idx_to_centroid = {
-            int(k): (float(v[0]), float(v[1])) for k, v in obj["idx_to_centroid"].items()
-        }
+        h3_ids = [str(x) for x in obj["h3_ids"]]
+        h3_to_idx = {str(k): int(v) for k, v in obj["h3_to_idx"].items()}
+        idx_to_h3 = {int(k): str(v) for k, v in obj["idx_to_h3"].items()}
+        idx_to_centroid = {int(k): (float(v[0]), float(v[1])) for k, v in obj["idx_to_centroid"].items()}
         parent_res = int(obj.get("parent_res", 6))
 
-        if "h3_ids_r6" in obj and "h3_r6_to_idx" in obj and "r7_to_r6" in obj:
-            h3_ids_r6 = list(obj["h3_ids_r6"])
-            h3_r6_to_idx = {k: int(v) for k, v in obj["h3_r6_to_idx"].items()}
-            idx_to_h3_r6 = {int(k): v for k, v in obj["idx_to_h3_r6"].items()}
-            idx_to_centroid_r6 = {
-                int(k): (float(v[0]), float(v[1])) for k, v in obj["idx_to_centroid_r6"].items()
-            }
+        has_h = ("h3_ids_r6" in obj) and ("h3_r6_to_idx" in obj) and ("r7_to_r6" in obj) and ("r6_to_r7" in obj)
+        if has_h:
+            h3_ids_r6 = [str(x) for x in obj["h3_ids_r6"]]
+            h3_r6_to_idx = {str(k): int(v) for k, v in obj["h3_r6_to_idx"].items()}
+            idx_to_h3_r6 = {int(k): str(v) for k, v in obj["idx_to_h3_r6"].items()}
+            idx_to_centroid_r6 = {int(k): (float(v[0]), float(v[1])) for k, v in obj["idx_to_centroid_r6"].items()}
             r7_to_r6 = {int(k): int(v) for k, v in obj["r7_to_r6"].items()}
             r6_to_r7 = {int(k): [int(x) for x in v] for k, v in obj["r6_to_r7"].items()}
         else:
@@ -192,7 +212,7 @@ class LabelSpace:
             h3_to_idx=h3_to_idx,
             idx_to_h3=idx_to_h3,
             idx_to_centroid=idx_to_centroid,
-            parent_res=parent_res,
+            parent_res=int(parent_res),
             h3_ids_r6=h3_ids_r6,
             h3_r6_to_idx=h3_r6_to_idx,
             idx_to_h3_r6=idx_to_h3_r6,
@@ -204,13 +224,14 @@ class LabelSpace:
 
 def compute_h3(df: pd.DataFrame, resolution: int) -> pd.DataFrame:
     df = df.copy()
-    df["h3_id"] = df.apply(lambda r: h3.latlng_to_cell(r["lat"], r["lon"], resolution), axis=1)
+    res = int(resolution)
+    df["h3_id"] = df.apply(lambda r: h3.latlng_to_cell(float(r["lat"]), float(r["lon"]), res), axis=1)
     return df
 
 
 def filter_sparse_cells(df: pd.DataFrame, min_samples: int) -> pd.DataFrame:
     counts = df["h3_id"].value_counts()
-    keep = set(counts[counts >= min_samples].index.tolist())
+    keep = set(counts[counts >= int(min_samples)].index.tolist())
     return df[df["h3_id"].isin(keep)].copy()
 
 
@@ -225,28 +246,35 @@ def build_h3_hierarchy(
     Dict[int, int],
     Dict[int, List[int]],
 ]:
-    parents: List[str] = []
-    for h in h3_ids:
-        try:
-            p_ = h3.cell_to_parent(h, int(parent_res))
-        except Exception:
-            p_ = h
-        parents.append(str(p_))
+    parent_res = int(parent_res)
 
-    h3_ids_r6 = sorted(set(parents))
-    h3_r6_to_idx = {h_: i for i, h_ in enumerate(h3_ids_r6)}
+    parents: List[str] = []
+    for h_ in h3_ids:
+        try:
+            parents.append(str(h3.cell_to_parent(str(h_), parent_res)))
+        except Exception:
+            parents.append(str(h_))
+
+    # Stable R6 indexing by FIRST APPEARANCE in parents list
+    h3_ids_r6: List[str] = []
+    h3_r6_to_idx: Dict[str, int] = {}
+    for p_ in parents:
+        if p_ not in h3_r6_to_idx:
+            h3_r6_to_idx[p_] = len(h3_ids_r6)
+            h3_ids_r6.append(p_)
+
     idx_to_h3_r6 = {i: h_ for h_, i in h3_r6_to_idx.items()}
 
     idx_to_centroid_r6: Dict[int, Tuple[float, float]] = {}
     for i, h_ in idx_to_h3_r6.items():
         lat, lon = h3.cell_to_latlng(h_)
-        idx_to_centroid_r6[i] = (float(lat), float(lon))
+        idx_to_centroid_r6[int(i)] = (float(lat), float(lon))
 
     r7_to_r6: Dict[int, int] = {}
     r6_to_r7: Dict[int, List[int]] = {i: [] for i in idx_to_h3_r6.keys()}
 
-    for r7_idx, parent in enumerate(parents):
-        r6_idx = int(h3_r6_to_idx[parent])
+    for r7_idx, p_ in enumerate(parents):
+        r6_idx = int(h3_r6_to_idx[p_])
         r7_to_r6[int(r7_idx)] = r6_idx
         r6_to_r7[r6_idx].append(int(r7_idx))
 
@@ -254,14 +282,17 @@ def build_h3_hierarchy(
 
 
 def build_label_space(df: pd.DataFrame, parent_res: int = 6) -> LabelSpace:
-    h3_ids = sorted(df["h3_id"].unique().tolist())
+    h3_ids = sorted(df["h3_id"].astype(str).unique().tolist())
+    if not h3_ids:
+        raise RuntimeError("No h3_id values found to build label space.")
+
     h3_to_idx = {h_: i for i, h_ in enumerate(h3_ids)}
     idx_to_h3 = {i: h_ for h_, i in h3_to_idx.items()}
 
     idx_to_centroid: Dict[int, Tuple[float, float]] = {}
     for i, h_ in idx_to_h3.items():
         lat, lon = h3.cell_to_latlng(h_)
-        idx_to_centroid[i] = (float(lat), float(lon))
+        idx_to_centroid[int(i)] = (float(lat), float(lon))
 
     (
         h3_ids_r6,
@@ -270,7 +301,7 @@ def build_label_space(df: pd.DataFrame, parent_res: int = 6) -> LabelSpace:
         idx_to_centroid_r6,
         r7_to_r6,
         r6_to_r7,
-    ) = build_h3_hierarchy(h3_ids, parent_res=parent_res)
+    ) = build_h3_hierarchy(h3_ids, parent_res=int(parent_res))
 
     return LabelSpace(
         h3_ids=h3_ids,
@@ -288,21 +319,79 @@ def build_label_space(df: pd.DataFrame, parent_res: int = 6) -> LabelSpace:
 
 
 # ============================================================================
-# Dataset (ex dataset.py)
+# Dataset
 # ============================================================================
+
+
+def build_transform(image_size: int):
+    """
+    Torchvision transform used both for training and inference.
+    Kept here so predict.py doesn't depend on GeoDataset internals.
+    """
+    image_size = int(image_size)
+    return transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
+
+
+def _proxy_defaults() -> List[str]:
+    return [
+        "proxy_elev_log1p_z",
+        "proxy_pop_log1p_z",
+        "proxy_water_frac",
+        "proxy_built_frac",
+        "proxy_coastal_score",
+    ]
+
+
+def _build_proxy_vector_and_mask(row: pd.Series, cols: Sequence[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      proxy_targets: float32 [P]
+      proxy_mask:    float32 [P] (0/1)
+    Missing/non-finite values become 0 with mask=0.
+    """
+    P = int(len(cols))
+    vals = torch.zeros((P,), dtype=torch.float32)
+    mask = torch.zeros((P,), dtype=torch.float32)
+
+    for j, col in enumerate(cols):
+        if col not in row.index:
+            continue
+        v = row[col]
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if math.isfinite(fv):
+            vals[j] = float(fv)
+            mask[j] = 1.0
+
+    return vals, mask
+
 
 class GeoDataset(Dataset):
     """
     Processed-only dataset.
 
     Returns:
-      - non-hierarchical:
-          (x, y, lat, lon, image_id)
-      - hierarchical:
-          (x, y_r6, y_r7, lat, lon, image_id)
+      - non-hierarchical (UNCHANGED):
+          (x, y, proxies, lat, lon, image_id)
+      - hierarchical (UNCHANGED):
+          (x, y_r6, y_r7, proxies, lat, lon, image_id)
+
+    If proxies_enabled=True, APPENDS:
+      - proxy_targets (float32 [P])
+      - proxy_mask    (float32 [P])
 
     Absolutely NO raw handling.
-    Absolutely NO proxy / h3_features.
     """
 
     def __init__(
@@ -312,11 +401,24 @@ class GeoDataset(Dataset):
         image_size: int,
         *,
         hierarchical_enabled: bool = False,
+        # legacy (kept): provides "proxies" tensor in the legacy slot (or None)
+        use_proxies: bool = False,
+        # new: appends (proxy_targets, proxy_mask) at the end
+        proxies_enabled: bool = False,
+        proxy_columns: Optional[Sequence[str]] = None,
     ) -> None:
         self.parquet_path = Path(parquet_path)
         self.split = str(split)
         self.image_size = int(image_size)
         self.hierarchical_enabled = bool(hierarchical_enabled)
+
+        # legacy proxies slot
+        self.use_proxies = bool(use_proxies)
+
+        # new appended proxy targets
+        self.proxies_enabled = bool(proxies_enabled)
+
+        self.proxy_cols: List[str] = list(proxy_columns) if proxy_columns is not None else _proxy_defaults()
 
         if not self.parquet_path.exists():
             raise FileNotFoundError(f"Parquet not found: {self.parquet_path}")
@@ -329,43 +431,42 @@ class GeoDataset(Dataset):
             raise RuntimeError(f"Parquet missing columns: {sorted(missing)}")
 
         if self.hierarchical_enabled:
-            hier_required = {"label_r6_idx"}
-            missing_h = hier_required - set(df.columns)
+            required_h = {"label_r6_idx"}
+            missing_h = required_h - set(df.columns)
             if missing_h:
-                raise RuntimeError(
-                    f"hierarchical_enabled=True but missing columns: {sorted(missing_h)}"
-                )
+                raise RuntimeError(f"hierarchical_enabled=True but missing columns: {sorted(missing_h)}")
 
         df = df[df["split"] == self.split].reset_index(drop=True)
         if df.empty:
-            raise RuntimeError(
-                f"No samples for split='{self.split}' in {self.parquet_path}"
-            )
+            raise RuntimeError(f"No samples for split='{self.split}' in {self.parquet_path}")
 
         # processed-only path validation
-        paths = df["path"].astype(str)
-        missing_files = [p_ for p_ in paths if not Path(p_).exists()]
+        missing_files: List[str] = []
+        for s in df["path"].astype(str).tolist():
+            if not Path(s).exists():
+                missing_files.append(s)
+                if len(missing_files) >= 20:
+                    break
         if missing_files:
             raise RuntimeError(
                 f"{len(missing_files)} processed images are missing on disk. "
                 f"Example: {missing_files[0]}"
             )
 
-        self.df = df
+        # If proxy targets are enabled, ensure requested columns exist.
+        if self.proxies_enabled:
+            missing_proxy_cols = [c for c in self.proxy_cols if c not in df.columns]
+            if missing_proxy_cols:
+                raise RuntimeError(
+                    "proxies_enabled=True but parquet is missing proxy columns: "
+                    f"{missing_proxy_cols}"
+                )
 
-        self.transform = transforms.Compose(
-            [
-                transforms.Resize((self.image_size, self.image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ]
-        )
+        self.df = df
+        self.transform = build_transform(self.image_size)
 
     def __len__(self) -> int:
-        return len(self.df)
+        return int(len(self.df))
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[int(idx)]
@@ -378,43 +479,57 @@ class GeoDataset(Dataset):
 
         x = self.transform(img)
 
-        lat = float(row["lat"])
-        lon = float(row["lon"])
+        # --- legacy proxies slot (kept stable)
+        # IMPORTANT: NEVER return None here, otherwise default_collate will crash.
+        # When legacy proxies are disabled, return an empty float tensor.
+        proxies: torch.Tensor = torch.zeros((0,), dtype=torch.float32)
+        if self.use_proxies:
+            proxy_targets, _proxy_mask = _build_proxy_vector_and_mask(row, self.proxy_cols)
+            # legacy behavior: provide a tensor (values) even if some are missing (filled with 0)
+            proxies = proxy_targets
+
+        lat = torch.tensor(float(row["lat"]), dtype=torch.float32)
+        lon = torch.tensor(float(row["lon"]), dtype=torch.float32)
         image_id = str(row["id"])
 
         if self.hierarchical_enabled:
-            y_r6 = int(row["label_r6_idx"])
-            y_r7 = int(row["label_idx"])
-            return (
-                x,
-                torch.tensor(y_r6, dtype=torch.long),
-                torch.tensor(y_r7, dtype=torch.long),
-                torch.tensor(lat, dtype=torch.float32),
-                torch.tensor(lon, dtype=torch.float32),
-                image_id,
-            )
+            y_r6 = torch.tensor(int(row["label_r6_idx"]), dtype=torch.long)
+            y_r7 = torch.tensor(int(row["label_idx"]), dtype=torch.long)
+            base = (x, y_r6, y_r7, proxies, lat, lon, image_id)
+        else:
+            y = torch.tensor(int(row["label_idx"]), dtype=torch.long)
+            base = (x, y, proxies, lat, lon, image_id)
 
-        y = int(row["label_idx"])
-        return (
-            x,
-            torch.tensor(y, dtype=torch.long),
-            torch.tensor(lat, dtype=torch.float32),
-            torch.tensor(lon, dtype=torch.float32),
-            image_id,
-        )
+        if not self.proxies_enabled:
+            return base
+
+        # --- appended proxy targets + mask (NEW)
+        proxy_targets, proxy_mask = _build_proxy_vector_and_mask(row, self.proxy_cols)
+        return (*base, proxy_targets, proxy_mask)
 
     def all_ids(self) -> List[str]:
         return [str(v) for v in self.df["id"].tolist()]
 
 
 # ============================================================================
-# Merge splits + kept-only + labels (ex merge_splits.py)
+# Merge splits + kept-only + labels
 # ============================================================================
+
 
 def _require_cols(df: pd.DataFrame, cols: List[str], name: str) -> None:
     missing = [c for c in cols if c not in df.columns]
     if missing:
         raise RuntimeError(f"{name} missing columns: {missing}")
+
+
+def _drop_missing_paths(df: pd.DataFrame, path_col: str = "path") -> Tuple[pd.DataFrame, int]:
+    if path_col not in df.columns:
+        return df, 0
+    m = ~df[path_col].map(lambda s: Path(str(s)).exists())
+    n = int(m.sum())
+    if n <= 0:
+        return df, 0
+    return df.loc[~m].copy(), n
 
 
 def merge_splits_and_build_training_parquet(
@@ -427,11 +542,23 @@ def merge_splits_and_build_training_parquet(
     min_cell_samples: int = 30,
     drop_missing_files: bool = False,
     parent_res: int = 6,
+    kept_policy: str = "train_only",
 ) -> Dict[str, Path]:
     """
-    Merge split column, then create a kept-only training parquet where each (split, h3_id)
-    has at least min_cell_samples. Builds labels.json from kept-only classes and adds label_idx.
-    Also adds label_r6_idx for hierarchical training.
+    Merge split column, then create a kept-only training parquet, build labels.json, and add:
+      - label_idx (R7)
+      - label_r6_idx (R6)
+      - writes r7_to_r6 mapping in labels.json
+
+    Critical invariant:
+      If you drop missing files, you MUST do it BEFORE computing "kept",
+      otherwise you break the min_cell_samples guarantee.
+
+    kept_policy:
+      - "train_only" (RECOMMENDED): keep labels where train_count(h3_id) >= min_cell_samples,
+        and keep val/test rows ONLY for those labels (even if val/test counts are small).
+      - "per_split" (STRICT): keep rows only if (split, h3_id) >= min_cell_samples for ALL splits.
+        This usually collapses val/test.
     """
     parquet = Path(parquet)
     splits = Path(splits)
@@ -472,74 +599,92 @@ def merge_splits_and_build_training_parquet(
         ex = df.loc[df["split"].isna(), ["line_idx", "id"]].head(10).to_dict("records")
         raise RuntimeError(f"{n} rows missing split after merge. Examples: {ex}")
 
-    # full write
+    # Drop missing files BEFORE kept filtering (kept invariants depend on it)
+    if drop_missing_files:
+        df, n_drop = _drop_missing_paths(df, "path")
+        if n_drop > 0:
+            print(f"Dropping {n_drop} rows with missing files (pre-kept).")
+
+    # Full write (post-drop, post-split merge)
     out_full.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_full, index=False)
     print(f"Wrote full dataset: {out_full}")
 
-    # kept-only per (split, h3_id)
-    counts = df.groupby(["split", "h3_id"]).size().reset_index(name="cell_count_split")
-    df2 = df.merge(counts, on=["split", "h3_id"], how="left")
-    df2["cell_count_split"] = df2["cell_count_split"].fillna(0).astype(int)
-    df2["is_kept"] = df2["cell_count_split"] >= int(min_cell_samples)
+    # ---- kept selection
+    min_cell_samples = int(min_cell_samples)
+    kept_policy = str(kept_policy).strip().lower()
 
-    df_kept = df2[df2["is_kept"]].copy()
+    if kept_policy not in {"train_only", "per_split"}:
+        raise ValueError("kept_policy must be one of: train_only, per_split")
 
-    if drop_missing_files:
-        missing_mask = ~df_kept["path"].map(lambda s: Path(str(s)).exists())
-        if missing_mask.any():
-            print(f"Dropping {int(missing_mask.sum())} kept rows with missing files")
-            df_kept = df_kept.loc[~missing_mask].copy()
+    if kept_policy == "train_only":
+        tr = df[df["split"] == "train"].copy()
+        if tr.empty:
+            raise RuntimeError("No train rows found after merge (and optional drop).")
+        counts = tr.groupby("h3_id").size()
+        kept_labels = set(counts[counts >= min_cell_samples].index.astype(str).tolist())
+        df_kept = df[df["h3_id"].astype(str).isin(kept_labels)].copy()
+    else:
+        # STRICT: keep only if (split, h3_id) >= min_cell_samples
+        counts2 = df.groupby(["split", "h3_id"]).size().reset_index(name="cell_count_split")
+        df2 = df.merge(counts2, on=["split", "h3_id"], how="left")
+        df2["cell_count_split"] = df2["cell_count_split"].fillna(0).astype(int)
+        df2["is_kept"] = df2["cell_count_split"] >= min_cell_samples
+        df_kept = df2[df2["is_kept"]].copy()
 
     if df_kept.empty:
-        raise RuntimeError(
-            "Kept-only dataset is empty. Lower min_cell_samples or download more data."
-        )
+        raise RuntimeError("Kept-only dataset is empty. Lower min_cell_samples or download more data.")
 
-    # labels from kept-only
+    # ---- labels from kept-only (R7)
     labels = sorted(df_kept["h3_id"].dropna().astype(str).unique().tolist())
     if len(labels) <= 1:
         raise RuntimeError(
             f"Num kept classes looks wrong: {len(labels)}. "
-            "Check h3_id generation and min-cell-samples per split."
+            "Check h3_id generation and min-cell-samples policy."
         )
 
     label_to_idx = {h_: i for i, h_ in enumerate(labels)}
     df_kept["label_idx"] = df_kept["h3_id"].astype(str).map(label_to_idx).astype(int)
 
-    # hierarchical r6 labels
-    # Build r7->r6 mapping in the SAME order as labels list (r7 index = label_idx)
-    # We compute r6 index from parent cell list.
-    parents = []
+    # ---- hierarchy mapping (R7 -> R6), stable R6 indexing by first appearance in parents list
+    parent_res = int(parent_res)
+    parents: List[str] = []
     for h_ in labels:
         try:
-            p_ = h3.cell_to_parent(h_, int(parent_res))
+            parents.append(str(h3.cell_to_parent(str(h_), parent_res)))
         except Exception:
-            p_ = h_
-        parents.append(str(p_))
-    h3_ids_r6 = sorted(set(parents))
-    h3_r6_to_idx = {h_: i for i, h_ in enumerate(h3_ids_r6)}
-    r7_to_r6 = {i: int(h3_r6_to_idx[parents[i]]) for i in range(len(parents))}
+            parents.append(str(h_))
 
+    h3_ids_r6: List[str] = []
+    h3_r6_to_idx: Dict[str, int] = {}
+    for p_ in parents:
+        if p_ not in h3_r6_to_idx:
+            h3_r6_to_idx[p_] = len(h3_ids_r6)
+            h3_ids_r6.append(p_)
+
+    r7_to_r6 = {i: int(h3_r6_to_idx[parents[i]]) for i in range(len(parents))}
     df_kept["label_r6_idx"] = df_kept["label_idx"].map(r7_to_r6).astype(int)
 
-    # write kept parquet
+    # ---- write kept parquet
     out_kept.parent.mkdir(parents=True, exist_ok=True)
     df_kept.to_parquet(out_kept, index=False)
     print(f"Wrote kept-only dataset: {out_kept}")
 
-    # write labels.json (compatible with your existing format)
+    # ---- write labels.json (compact + compatible with run.py)
     labels_out.parent.mkdir(parents=True, exist_ok=True)
     labels_out.write_text(
         json.dumps(
             {
-                "num_classes": len(labels),
+                "num_classes": int(len(labels)),
                 "labels": labels,
                 "label_to_idx": label_to_idx,
                 "parent_res": int(parent_res),
                 "h3_ids_r6": h3_ids_r6,
                 "h3_r6_to_idx": h3_r6_to_idx,
                 "r7_to_r6": r7_to_r6,
+                "kept_policy": kept_policy,
+                "min_cell_samples": int(min_cell_samples),
+                "drop_missing_files": bool(drop_missing_files),
             },
             indent=2,
         )
@@ -548,26 +693,24 @@ def merge_splits_and_build_training_parquet(
     )
     print(f"Wrote labels: {labels_out}")
 
-    print("\nFull split distribution:")
+    # ---- logs
+    print("\nFull split distribution (post-drop):")
     print(df["split"].value_counts())
 
     print("\nKept split distribution:")
     print(df_kept["split"].value_counts())
 
     print("\nNum kept classes:", len(labels))
-    print("Samples per cell (kept):")
+    print("Samples per class (kept):")
     print(df_kept.groupby("h3_id").size().describe())
 
-    return {
-        "out_full": out_full,
-        "out_kept": out_kept,
-        "labels_out": labels_out,
-    }
+    return {"out_full": out_full, "out_kept": out_kept, "labels_out": labels_out}
 
 
 # ============================================================================
-# Split coverage check (ex check_split_coverage.py)
+# Split coverage check (jsonl)
 # ============================================================================
+
 
 def check_split_coverage_jsonl(
     *,
@@ -618,8 +761,9 @@ def check_split_coverage_jsonl(
 
 
 # ============================================================================
-# Export splits from parquet (ex export_splits_from_parquet.py)
+# Export splits from parquet -> jsonl
 # ============================================================================
+
 
 def export_splits_jsonl_from_parquet(
     *,
@@ -658,8 +802,9 @@ def export_splits_jsonl_from_parquet(
 
 
 # ============================================================================
-# Optional: tiny CLI wrapper (so you can do: python -m src.data ...)
+# Tiny CLI wrapper
 # ============================================================================
+
 
 def _cmd_make_splits(args: argparse.Namespace) -> None:
     out = make_splits_parquet(
@@ -685,6 +830,7 @@ def _cmd_merge_splits(args: argparse.Namespace) -> None:
         min_cell_samples=int(args.min_cell_samples),
         drop_missing_files=bool(args.drop_missing_files),
         parent_res=int(args.parent_res),
+        kept_policy=str(args.kept_policy),
     )
 
 
@@ -726,6 +872,12 @@ def main() -> None:
     mg.add_argument("--min-cell-samples", type=int, default=30)
     mg.add_argument("--drop-missing-files", action="store_true")
     mg.add_argument("--parent-res", type=int, default=6)
+    mg.add_argument(
+        "--kept-policy",
+        default="train_only",
+        choices=["train_only", "per_split"],
+        help="train_only keeps labels with enough train samples; per_split requires enough samples in each split.",
+    )
     mg.set_defaults(func=_cmd_merge_splits)
 
     cc = sub.add_parser("check-coverage", help="Check images.jsonl vs splits.jsonl coverage.")
@@ -746,23 +898,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-def build_transform(image_size: int):
-    """
-    Torchvision transform used both for training and inference.
-    Kept here so predict.py doesn't depend on GeoDataset internals.
-    """
-    from torchvision import transforms
-
-    image_size = int(image_size)
-    return transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ]
-    )
